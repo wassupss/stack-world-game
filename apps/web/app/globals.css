@@ -1,0 +1,79 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 터미널 스타일 커스텀 */
+:root {
+  --terminal-green: #00ff41;
+  --terminal-amber: #ffb000;
+  --terminal-red: #ff3333;
+  --terminal-blue: #00aaff;
+  --terminal-gray: #888888;
+  --terminal-bg: #0a0a0a;
+  --terminal-panel: #0f0f0f;
+  --terminal-border: #1a1a1a;
+}
+
+html, body {
+  background-color: var(--terminal-bg);
+  color: var(--terminal-green);
+  font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace;
+  height: 100%;
+  overflow: hidden;
+}
+
+/* 커서 깜빡임 */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.cursor-blink {
+  animation: blink 1s step-end infinite;
+}
+
+/* CRT 스캔라인 효과 (옵션) */
+.scanlines::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    0deg,
+    transparent,
+    transparent 2px,
+    rgba(0, 0, 0, 0.03) 2px,
+    rgba(0, 0, 0, 0.03) 4px
+  );
+  pointer-events: none;
+  z-index: 9999;
+}
+
+/* 스크롤바 스타일 */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: var(--terminal-bg);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--terminal-green);
+  border-radius: 2px;
+}
+
+/* 터미널 로그 색상 클래스 */
+.log-info    { color: var(--terminal-green); }
+.log-warn    { color: var(--terminal-amber); }
+.log-error   { color: var(--terminal-red); }
+.log-success { color: #00ff41; font-weight: bold; }
+.log-system  { color: var(--terminal-gray); font-style: italic; }
+
+/* 자동완성 드롭다운 */
+.autocomplete-item {
+  @apply px-2 py-1 cursor-pointer hover:bg-green-900/30 text-green-400;
+}
+.autocomplete-item.selected {
+  @apply bg-green-900/50 text-green-300;
+}
