@@ -77,3 +77,67 @@ html, body {
 .autocomplete-item.selected {
   @apply bg-green-900/50 text-green-300;
 }
+
+/* ──────────── 애니메이션 효과 ──────────── */
+
+/* 로그 라인 등장: 슬라이드+페이드인 */
+@keyframes log-in {
+  from { opacity: 0; transform: translateX(-8px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+.animate-log-in {
+  animation: log-in 0.14s ease-out both;
+}
+
+/* 위험 경고 깜빡임 */
+@keyframes danger-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.2; }
+}
+.animate-danger {
+  animation: danger-blink 0.75s ease-in-out infinite;
+}
+
+/* 스트릭 / 승리 글로우 펄스 */
+@keyframes glow-pulse {
+  0%, 100% { opacity: 1;    filter: brightness(1); }
+  50%       { opacity: 0.8; filter: brightness(1.9) drop-shadow(0 0 8px currentColor); }
+}
+.animate-glow {
+  animation: glow-pulse 1.4s ease-in-out infinite;
+}
+
+/* 치명타 글리치 */
+@keyframes glitch {
+  0%   { transform: translateX(0)    skewX(0deg); }
+  15%  { transform: translateX(-3px) skewX(-2deg); }
+  30%  { transform: translateX(3px)  skewX(2deg); }
+  55%  { transform: translateX(-2px) skewX(0deg); }
+  75%  { transform: translateX(2px)  skewX(-1deg); }
+  100% { transform: translateX(0)    skewX(0deg); }
+}
+.animate-glitch {
+  animation: glitch 0.48s ease-in-out;
+}
+
+/* 실수/실패 흔들림 */
+@keyframes shake {
+  0%, 100% { transform: translateX(0); }
+  15%       { transform: translateX(-4px); }
+  35%       { transform: translateX(4px); }
+  55%       { transform: translateX(-3px); }
+  75%       { transform: translateX(3px); }
+  90%       { transform: translateX(-1px); }
+}
+.animate-shake {
+  animation: shake 0.38s ease-in-out;
+}
+
+/* 화면 플래시 오버레이 */
+@keyframes flash-fade {
+  0%   { opacity: 1; }
+  100% { opacity: 0; }
+}
+.flash-gold  { background: rgba(255, 200, 0,  0.22); animation: flash-fade 0.7s ease-out forwards; }
+.flash-red   { background: rgba(255, 50,  50, 0.18); animation: flash-fade 0.5s ease-out forwards; }
+.flash-green { background: rgba(0,   255, 65, 0.14); animation: flash-fade 0.8s ease-out forwards; }

@@ -3,7 +3,7 @@
 // ============================================================
 // STACKWORLD - 로그 패널 (인터랙티브 + 애니메이션 지원)
 // ============================================================
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { LogLine, InteractiveItem } from "@stack-world/shared";
 
 interface Props {
@@ -54,7 +54,9 @@ export default function LogPanel({ logs, onCommand, scrollTrigger }: Props) {
       className="h-full overflow-y-auto px-3 py-2 font-mono text-xs leading-relaxed"
     >
       {logs.map((log, i) => (
-        <LogEntry key={i} log={log} onCommand={onCommand} />
+        <div key={i} className="animate-log-in">
+          <LogEntry log={log} onCommand={onCommand} />
+        </div>
       ))}
       <div ref={bottomRef} />
     </div>
@@ -186,7 +188,8 @@ function AnimatedRollEntry({ log, time }: { log: LogLine; time: string }) {
 
   const [animFrame, setAnimFrame] = useState(0);
   const [done, setDone] = useState(false);
-  const TOTAL_FRAMES = 7;
+  const [revealed, setRevealed] = useState(false);
+  const TOTAL_FRAMES = 9;
 
   useEffect(() => {
     let frame = 0;
@@ -197,29 +200,44 @@ function AnimatedRollEntry({ log, time }: { log: LogLine; time: string }) {
         clearInterval(interval);
         setDone(true);
       }
-    }, 70);
+    }, 65);
     return () => clearInterval(interval);
   }, []);
+
+  // 결과 공개 후 약간의 딜레이 → 글리치/흔들림 시작
+  useEffect(() => {
+    if (!done) return;
+    const t = setTimeout(() => setRevealed(true), 80);
+    return () => clearTimeout(t);
+  }, [done]);
 
   const width = 20;
   const roll = data?.roll ?? 0;
   const threshold = data?.threshold ?? 0;
 
-  const makeBar = (markerPos: number) => {
-    const chars: string[] = Array.from({ length: width }, () => "─");
+  const makeBar = useCallback((markerPos: number) => {
     const threshPos = Math.min(width - 1, Math.floor(threshold * width));
+    if (done) {
+      // 결과 공개 바: 마커 왼쪽은 채움, 오른쪽은 비움
+      return Array.from({ length: width }, (_, i) => {
+        if (i === Math.min(width - 1, markerPos)) return "▲";
+        if (i === threshPos) return "|";
+        return i < markerPos ? "█" : "░";
+      }).join("");
+    }
+    // 애니메이션 중: 빈 바 + 임계선 + 이동하는 마커
+    const chars: string[] = Array.from({ length: width }, () => "─");
     chars[threshPos] = "|";
     chars[Math.min(width - 1, markerPos)] = "▲";
     return chars.join("");
-  };
+  }, [done, threshold, width]);
 
   const finalPos = Math.min(width - 1, Math.floor(roll * width));
-  // Animation: marker bounces, converging on final position
   const animPos = done
     ? finalPos
     : Math.round(Math.abs(Math.sin((animFrame / TOTAL_FRAMES) * Math.PI * 3)) * (width - 1));
 
-  const outcome = data?.isCritical ? "CRITICAL" : data?.isFumble ? "FUMBLE" : data?.isSuccess ? "SUCCESS" : "FAIL";
+  const outcome = data?.isCritical ? "치명타★" : data?.isFumble ? "실수" : data?.isSuccess ? "성공" : "실패";
   const outcomeColor = data?.isCritical
     ? "text-yellow-300 font-bold"
     : data?.isFumble
@@ -228,14 +246,20 @@ function AnimatedRollEntry({ log, time }: { log: LogLine; time: string }) {
     ? "text-green-300"
     : "text-yellow-400";
 
+  const animClass = revealed
+    ? data?.isCritical ? "animate-glitch"
+    : data?.isFumble   ? "animate-shake"
+    : ""
+    : "";
+
   return (
-    <div className={`flex gap-2 font-mono text-xs ${done ? outcomeColor : "text-green-600"}`}>
+    <div className={`flex gap-2 font-mono text-xs ${done ? outcomeColor : "text-green-600"} ${animClass}`}>
       <span className="text-green-900 shrink-0 select-none">{time}</span>
       <span>
-        DICE&nbsp;&nbsp;[{makeBar(animPos)}]&nbsp;&nbsp;
+        판정&nbsp;&nbsp;[{makeBar(animPos)}]&nbsp;&nbsp;
         {done
           ? `${roll.toFixed(3)} vs ${threshold.toFixed(3)} → ${outcome}`
-          : "ROLLING..."}
+          : "판정 중..."}
       </span>
     </div>
   );

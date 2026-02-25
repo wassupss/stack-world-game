@@ -159,9 +159,13 @@ export default function CommandInput({ onSubmit, isProcessing, activeRunId, acti
     [input, history, historyIdx, suggestions, selectedSuggestion, isProcessing, onSubmit, quickMode, onQuickModeExit],
   );
 
-  // 항상 입력창 포커스 유지
+  // 빈 영역 클릭 시 터미널 입력창으로 포커스 — input/textarea는 제외
   useEffect(() => {
-    const handleClick = () => inputRef.current?.focus();
+    const handleClick = (e: MouseEvent) => {
+      const tag = (e.target as HTMLElement).tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      inputRef.current?.focus();
+    };
     document.addEventListener("click", handleClick);
     return () => document.removeEventListener("click", handleClick);
   }, []);

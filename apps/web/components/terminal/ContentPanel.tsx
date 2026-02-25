@@ -21,11 +21,11 @@ interface Props {
 // ──────────── 페이즈 정의 ────────────
 const PHASES = ["plan", "implement", "test", "deploy", "operate"] as const;
 const PHASE_SHORT: Record<string, string> = {
-  plan:      "PLAN",
-  implement: "IMPL",
-  test:      "TEST",
-  deploy:    "DEPL",
-  operate:   "OPS",
+  plan:      "기획",
+  implement: "구현",
+  test:      "테스트",
+  deploy:    "배포",
+  operate:   "운영",
 };
 
 // ──────────── 레이드 시나리오 이름 ────────────
@@ -127,18 +127,19 @@ function RunContent({ run }: { run: Record<string, unknown> }) {
 
       {/* 자원 바 */}
       <div className="space-y-1">
-        <ResourceBar label="TIME" value={time}    max={100} color={timeColor} danger={timeDanger} />
-        <ResourceBar label="RISK" value={risk}    max={100} color={riskColor} danger={riskDanger} />
-        <ResourceBar label="DEBT" value={debt}    max={50}  color={debtColor} danger={debt > 35}  />
-        <ResourceBar label="QUAL" value={quality} max={100} color={qualColor} danger={quality < 20} />
+        <ResourceBar label="시간" value={time}    max={100} color={timeColor} danger={timeDanger} />
+        <ResourceBar label="위험" value={risk}    max={100} color={riskColor} danger={riskDanger} />
+        <ResourceBar label="부채" value={debt}    max={50}  color={debtColor} danger={debt > 35}  />
+        <ResourceBar label="품질" value={quality} max={100} color={qualColor} danger={quality < 20} />
       </div>
 
       {/* 위험 경고 */}
-      {(timeDanger || riskDanger) && (
-        <div className="text-[10px] text-red-500 border border-red-900 px-2 py-0.5 text-center">
-          {timeDanger && riskDanger ? "⚠ TIME 부족 · RISK 위험"
-            : timeDanger ? "⚠ TIME 부족"
-            : "⚠ RISK 위험 수준"}
+      {(timeDanger || riskDanger || debt > 35 || quality < 20) && (
+        <div className="text-[10px] text-red-500 border border-red-900 px-2 py-0.5 text-center space-y-0.5 animate-danger">
+          {timeDanger && <div>⚠ 시간 부족</div>}
+          {riskDanger && <div>⚠ 위험 수준 위험</div>}
+          {debt > 35 && <div>⚠ 기술 부채 압박</div>}
+          {quality < 20 && <div>⚠ 코드 품질 위기</div>}
         </div>
       )}
 
@@ -306,9 +307,9 @@ function ResourceBar({ label, value, max, color, danger }: {
   const cls    = BAR_COLORS[color] ?? "text-green-400";
   return (
     <div className="flex items-center gap-1">
-      <span className={`w-8 shrink-0 ${danger ? "text-red-500" : "text-green-700"}`}>{label}</span>
-      <span className={`${cls} text-[10px]`}>{bar}</span>
-      <span className={`ml-auto w-8 text-right ${danger ? "text-red-400 font-bold" : "text-green-500"}`}>
+      <span className={`w-8 shrink-0 ${danger ? "text-red-500 animate-danger" : "text-green-700"}`}>{label}</span>
+      <span className={`${cls} text-[10px] ${danger ? "animate-danger" : ""}`}>{bar}</span>
+      <span className={`ml-auto w-8 text-right ${danger ? "text-red-400 font-bold animate-danger" : "text-green-500"}`}>
         {value}
       </span>
     </div>
@@ -317,30 +318,33 @@ function ResourceBar({ label, value, max, color, danger }: {
 
 function StreakBadge({ streak }: { streak: number }) {
   const label =
-    streak >= 10 ? `★★★ UNSTOPPABLE x${streak}` :
-    streak >= 5  ? `★★ ON FIRE! x${streak}` :
-    streak >= 3  ? `★ STREAK x${streak}` :
-                   `STREAK x${streak}`;
+    streak >= 10 ? `★★★ 무아지경 x${streak}` :
+    streak >= 5  ? `★★ 불타오른다! x${streak}` :
+    streak >= 3  ? `★ 연속 x${streak}` :
+                   `연속 x${streak}`;
   const cls =
     streak >= 10 ? "text-yellow-300 font-bold" :
     streak >= 5  ? "text-yellow-400 font-bold" :
                    "text-green-300";
+  const glowCls = streak >= 3 ? "animate-glow" : "";
   return (
-    <div className={`text-center text-[10px] border border-green-800 py-0.5 ${cls}`}>{label}</div>
+    <div className={`text-center text-[10px] border border-green-800 py-0.5 ${cls} ${glowCls}`}>{label}</div>
   );
 }
 
 const EFFECT_LABELS: Record<string, string> = {
-  flow_state:          "FLOW  ↑성공률",
-  tired:               "TIRED ↑fumble",
-  focused:             "FOCUS +5QUAL/t",
-  guaranteed_critical: "CRIT★  next",
+  flow_state:          "몰입  ↑성공률",
+  tired:               "피로  ↑실수율",
+  focused:             "집중  +5품질/턴",
+  guaranteed_critical: "치명타★ 예약",
+  risk_shield:         "위험  방어막",
+  success_boost:       "성공  부스트",
 };
 
 function EffectsList({ effects }: { effects: ActiveEffect[] }) {
   return (
     <div className="border-t border-green-900 pt-2 space-y-0.5">
-      <div className="text-green-700 text-[10px] mb-1">── EFFECTS ──</div>
+      <div className="text-green-700 text-[10px] mb-1">── 활성 효과 ──</div>
       {effects.map((e, i) => (
         <div key={i} className="flex justify-between text-[10px]">
           <span className={
@@ -366,8 +370,8 @@ function KpiRow({ label, value, target, bad }: {
   return (
     <div className="flex items-center justify-between text-[10px]">
       <span className="text-green-700 w-12 shrink-0">{label}</span>
-      <span className={bad ? "text-red-400 font-bold" : "text-green-400"}>{value}</span>
-      <span className={`text-green-900 text-[9px] ${bad ? "text-red-900" : ""}`}>목표 {target}</span>
+      <span className={`font-bold ${bad ? "text-red-400 animate-danger" : "text-green-400"}`}>{value}</span>
+      <span className={`text-[9px] ${bad ? "text-red-900" : "text-green-900"}`}>목표 {target}</span>
     </div>
   );
 }

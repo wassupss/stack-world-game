@@ -7,9 +7,12 @@
 import { useEffect, useState, useCallback } from "react";
 import { createBrowserClient } from "@/lib/supabase/client";
 import type { LogLine } from "@stack-world/shared";
+import type { ChatMessage } from "@/components/terminal/RaidChatPanel";
 
 // 레이드 종료 이벤트 타입 (이 이벤트 수신 시 refreshState 호출)
-const RAID_END_EVENTS = new Set(["raid_victory", "raid_timeout", "raid_abandoned", "raid_resolved"]);
+// ※ raid_victory 는 제외 — executor.ts에서 party_leave await 후 autoRefresh로 처리
+//   Realtime에서 party_leave 전에 refreshState를 호출하면 party_info가 복원되는 race condition 발생
+const RAID_END_EVENTS = new Set(["raid_timeout", "raid_abandoned", "raid_resolved"]);
 
 interface RaidEvent {
   id: string;
@@ -23,13 +26,26 @@ interface RaidEvent {
 export function useRaidRealtime(
   raidId: string | undefined,
   onEvent: (log: LogLine) => void,
-  onRaidEnd?: () => void,   // 레이드 종료 이벤트 수신 시 콜백 (refreshState 전달)
+  onRaidEnd?: () => void,    // 레이드 종료 이벤트 수신 시 콜백
+  onChat?: (msg: ChatMessage) => void, // 채팅 메시지 수신 시 콜백
 ) {
   const [isConnected, setIsConnected] = useState(false);
   const supabase = createBrowserClient();
 
   const handleEvent = useCallback(
     (event: RaidEvent) => {
+      // 채팅 이벤트는 onChat으로 분리 (게임 로그에는 표시 안 함)
+      if (event.type === "raid_chat") {
+        const payload = event.payload as { character_name?: string; message?: string };
+        onChat?.({
+          id: event.id,
+          character_name: payload.character_name ?? "???",
+          message: payload.message ?? "",
+          timestamp: event.created_at,
+        });
+        return;
+      }
+
       const timestamp = new Date().toISOString();
       const typeLabel = formatEventType(event.type);
       onEvent({
@@ -44,7 +60,7 @@ export function useRaidRealtime(
         onRaidEnd?.();
       }
     },
-    [onEvent, onRaidEnd],
+    [onEvent, onRaidEnd, onChat],
   );
 
   useEffect(() => {

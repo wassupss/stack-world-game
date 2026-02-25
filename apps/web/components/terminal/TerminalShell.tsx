@@ -3,13 +3,16 @@
 // ============================================================
 // STACKWORLD - 메인 터미널 쉘 컴포넌트
 // ============================================================
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import LogPanel from "./LogPanel";
 import StatusPanel from "./StatusPanel";
 import ContentPanel from "./ContentPanel";
 import ShopPanel from "./ShopPanel";
+import CommunityPanel from "./CommunityPanel";
+import RaidChatPanel from "./RaidChatPanel";
 import CommandInput from "./CommandInput";
+import type { ChatMessage } from "./RaidChatPanel";
 import { parseCommand } from "@/lib/commands/parser";
 import { executeCommand } from "@/lib/commands/executor";
 import { createBrowserClient } from "@/lib/supabase/client";
@@ -56,6 +59,7 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
 
   const [activeRunId, setActiveRunId] = useState<string | undefined>();
   const [activeRaidId, setActiveRaidId] = useState<string | undefined>();
+  const [activePvpMatchId, setActivePvpMatchId] = useState<string | undefined>();
   const [statusData, setStatusData] = useState<Record<string, unknown>>({
     character,
     positionMastery,
@@ -63,10 +67,22 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
   });
   const [isProcessing, setIsProcessing] = useState(false);
   const [quickMode, setQuickMode] = useState<QuickMode | null>(null);
-  const [rightPanelMode, setRightPanelMode] = useState<"status" | "shop">("status");
+  const [rightPanelMode, setRightPanelMode] = useState<"status" | "shop" | "community">("status");
   const [scrollTrigger, setScrollTrigger] = useState(0);
+  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
+  const [flashType, setFlashType] = useState<"gold" | "red" | "green" | null>(null);
+  const [flashKey, setFlashKey] = useState(0);
+  const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const supabase = createBrowserClient();
+
+  const triggerFlash = useCallback((type: "gold" | "red" | "green") => {
+    if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
+    setFlashType(type);
+    setFlashKey((k) => k + 1);
+    const duration = type === "red" ? 600 : type === "gold" ? 800 : 950;
+    flashTimerRef.current = setTimeout(() => setFlashType(null), duration);
+  }, []);
 
   const addLog = useCallback((log: LogLine) => {
     setLogs((prev) => [...prev.slice(-500), log]);
@@ -97,7 +113,26 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
     refreshState();
   }, [refreshState]);
 
-  const { isConnected: isRaidConnected } = useRaidRealtime(activeRaidId, addLog, refreshState);
+  const addChat = useCallback((msg: ChatMessage) => {
+    setChatMessages((prev) => [...prev.slice(-200), msg]);
+  }, []);
+
+  const { isConnected: isRaidConnected } = useRaidRealtime(activeRaidId, addLog, refreshState, addChat);
+
+  // 레이드 채팅 직접 전송 (터미널 에코 없이)
+  const handleRaidChatSend = useCallback(async (msg: string) => {
+    if (!msg.trim() || !activeRaidId) return;
+    await fetch("/api/raid-command", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        action: "chat",
+        raid_id: activeRaidId,
+        message: msg.trim(),
+        idempotency_key: `${character.id}-chat-${Date.now()}`,
+      }),
+    });
+  }, [activeRaidId, character.id]);
 
   const handleCommand = useCallback(
     async (input: string) => {
@@ -130,11 +165,18 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
           characterId: character.id,
           activeRunId,
           activeRaidId,
+          activePvpMatchId,
           onStateUpdate: refreshState,
         });
 
         addLogs(result.logs);
         setScrollTrigger((n) => n + 1);
+
+        // 화면 플래시 (치명타=골드, 실수=레드, 레이드 클리어=그린)
+        const rollLog = result.logs.find((l) => l.level === "roll");
+        if (rollLog?.data?.isCritical) triggerFlash("gold");
+        else if (rollLog?.data?.isFumble) triggerFlash("red");
+        if (result.data?.raidEnded) triggerFlash("green");
 
         // QuickMode 설정 (event/draw 후 단축 입력 모드)
         if (result.quickMode) {
@@ -144,6 +186,25 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
         // SHOP 패널 자동 전환
         if (result.data?.openShop) {
           setRightPanelMode("shop");
+        }
+        // COMMUNITY 패널 자동 전환
+        if (result.data?.openCommunity) {
+          setRightPanelMode("community");
+        }
+
+        // PvP 매치 ID 설정 / 해제
+        if (result.data?.pvpMatchId) {
+          setActivePvpMatchId(String(result.data.pvpMatchId));
+        }
+        if (result.data?.pvpEnded) {
+          setActivePvpMatchId(undefined);
+        }
+
+        // 레이드 종료 시 NOW PLAYING 패널 즉시 해제 (race condition 방지)
+        if (result.data?.raidEnded) {
+          setActiveRaidId(undefined);
+          setStatusData((prev) => ({ ...prev, active_raid: null, party_info: null }));
+          setChatMessages([]);
         }
 
         // 자원 변경 커맨드 후 StatusPanel 자동 갱신
@@ -164,7 +225,14 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
   );
 
   return (
-    <div className="flex flex-col h-screen bg-black overflow-hidden">
+    <div className="flex flex-col h-screen bg-black overflow-hidden scanlines">
+      {/* 화면 플래시 오버레이 */}
+      {flashType && (
+        <div
+          key={flashKey}
+          className={`fixed inset-0 pointer-events-none z-50 flash-${flashType}`}
+        />
+      )}
       {/* 헤더 */}
       <div className="flex items-center justify-between px-4 py-1 border-b border-green-900 text-xs text-green-600">
         <span>STACKWORLD v0.1.0</span>
@@ -192,13 +260,30 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
             <div className="text-[10px] font-mono text-green-800 px-3 py-1 border-b border-green-900 shrink-0">
               ── NOW PLAYING ──
             </div>
-            <div className="flex-1 overflow-y-auto min-h-0">
+            {/* 런/레이드 상태 (최대 높이 제한 — 채팅 공간 확보) */}
+            <div className={`overflow-y-auto shrink-0 ${activeRaidId ? "max-h-[45%]" : "flex-1"}`}>
               <ContentPanel
                 statusData={statusData}
                 activeRunId={activeRunId}
                 activeRaidId={activeRaidId}
               />
             </div>
+            {/* 레이드 채팅 (레이드 중에만) */}
+            {activeRaidId && (
+              <>
+                <div className="text-[10px] font-mono text-green-800 px-3 py-1 border-y border-green-900 shrink-0">
+                  ── RAID CHAT ──
+                </div>
+                <div className="flex-1 min-h-0">
+                  <RaidChatPanel
+                    messages={chatMessages}
+                    myName={character.name}
+                    onSend={handleRaidChatSend}
+                    disabled={isProcessing}
+                  />
+                </div>
+              </>
+            )}
           </div>
         )}
 
@@ -206,20 +291,29 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
         <div className="w-72 flex flex-col border-l border-green-900 overflow-hidden">
           {/* 탭 바 */}
           <div className="flex border-b border-green-900 shrink-0">
-            <PanelTab label="STATUS" active={rightPanelMode === "status"} onClick={() => setRightPanelMode("status")} />
-            <PanelTab label="SHOP"   active={rightPanelMode === "shop"}   onClick={() => setRightPanelMode("shop")} />
+            <PanelTab label="STATUS"    active={rightPanelMode === "status"}    onClick={() => setRightPanelMode("status")} />
+            <PanelTab label="SHOP"      active={rightPanelMode === "shop"}      onClick={() => setRightPanelMode("shop")} />
+            <PanelTab label="COMM"      active={rightPanelMode === "community"} onClick={() => setRightPanelMode("community")} />
           </div>
           {/* 내용 */}
-          <div className="flex-1 overflow-y-auto min-h-0">
-            {rightPanelMode === "status" ? (
-              <StatusPanel statusData={statusData} />
-            ) : (
-              <ShopPanel
-                statusData={statusData}
-                activeRunId={activeRunId}
-                onLog={addLogs}
-                onRefreshStatus={refreshState}
-              />
+          <div className="flex-1 overflow-hidden min-h-0">
+            {rightPanelMode === "status" && (
+              <div className="overflow-y-auto h-full">
+                <StatusPanel statusData={statusData} />
+              </div>
+            )}
+            {rightPanelMode === "shop" && (
+              <div className="overflow-y-auto h-full">
+                <ShopPanel
+                  statusData={statusData}
+                  activeRunId={activeRunId}
+                  onLog={addLogs}
+                  onRefreshStatus={refreshState}
+                />
+              </div>
+            )}
+            {rightPanelMode === "community" && (
+              <CommunityPanel myName={character.name} myCharacterId={character.id} />
             )}
           </div>
         </div>

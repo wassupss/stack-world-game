@@ -25,6 +25,7 @@ export async function executeCommand(
     characterId: string;
     activeRunId?: string;
     activeRaidId?: string;
+    activePvpMatchId?: string;
     onStateUpdate?: () => void;
   },
 ): Promise<ExecuteResult> {
@@ -50,7 +51,7 @@ export async function executeCommand(
         };
       }
 
-      const categories = ["common", "solo", "party", "raid", "pvp", "market", "shop"];
+      const categories = ["common", "solo", "party", "raid", "pvp", "market", "shop", "community"];
       const logs: LogLine[] = [sys("━━ STACKWORLD 커맨드 목록 ━━")];
       for (const cat of categories) {
         logs.push(sys(`[${cat.toUpperCase()}]`));
@@ -109,6 +110,10 @@ export async function executeCommand(
       const tier = flags.tier ? parseInt(String(flags.tier)) : 1;
 
       if (subcommand === "start") {
+        // 동시 진행 방지: 레이드 중에는 솔로 런 불가
+        if (context.activeRaidId) {
+          return { logs: [err("레이드가 진행 중입니다. 먼저 레이드를 완료하거나 탈퇴하세요. (raid leave)")] };
+        }
         const res = await callAPI("/api/run-command", {
           action: "start",
           tier,
@@ -122,7 +127,7 @@ export async function executeCommand(
         return {
           logs: [
             sys(`┌${"─".repeat(46)}┐`),
-            sys(`│  Tier ${tier}  │  Phase: PLAN  │  seed: ...${seedStr}  │`),
+            sys(`│  Tier ${tier}  │  페이즈: 기획  │  seed: ...${seedStr}  │`),
             sys(`└${"─".repeat(46)}┘`),
             ...(resources ? formatResourceBars(resources) : []),
             sys("─".repeat(48)),
@@ -222,7 +227,7 @@ export async function executeCommand(
       return {
         logs: [
           success(`[선택] ${r?.choice}`),
-          info(`변화: TIME${tSign}${dt?.time}  RISK${rSign}${dt?.risk}  DEBT${dSign}${dt?.debt}  QUAL${qSign}${dt?.quality}`),
+          info(`변화: 시간${tSign}${dt?.time}  위험${rSign}${dt?.risk}  부채${dSign}${dt?.debt}  품질${qSign}${dt?.quality}`),
           ...(resources ? formatResourceBars(resources) : []),
         ],
         autoRefresh: true,
@@ -285,7 +290,7 @@ export async function executeCommand(
             return {
               label: ticket.title,
               command: `work ${ticket.ticket_key}`,
-              meta: `TIME:-${ticket.base_time_cost}  RISK:${rdStr}  QUAL:${qdStr}`,
+              meta: `시간:-${ticket.base_time_cost}  위험:${rdStr}  품질:${qdStr}`,
               badge: ticket.position_tag,
               key: drawLabels[i],
             };
@@ -295,7 +300,7 @@ export async function executeCommand(
       return {
         logs: [...preLogs, ...formatDrawHand(drawResult), drawInteractive],
         quickMode: {
-          hint: `A/B/C로 티켓 선택 (phase: ${String(drawResult?.phase ?? "")})`,
+          hint: `A/B/C로 티켓 선택 (페이즈: ${PHASE_KO[String(drawResult?.phase ?? "")] ?? String(drawResult?.phase ?? "")})`,
           map: Object.fromEntries(
             hand.map((ticket, i) => [drawLabels[i], `work ${ticket.ticket_key}`]),
           ),
@@ -334,9 +339,9 @@ export async function executeCommand(
 
       const logs: LogLine[] = [];
 
-      // ── 보증 크리티컬 소모 알림 ──
+      // ── 보장 치명타 소모 알림 ──
       if (guaranteedConsumed) {
-        logs.push(sys("  [★ GUARANTEED CRITICAL 발동!]"));
+        logs.push(sys("  [★ 보장 치명타 발동!]"));
       }
 
       // ── 주사위 바 ──
@@ -345,21 +350,21 @@ export async function executeCommand(
       // ── 결과 배너 ──
       if (isCritical) {
         logs.push(sys("╔════════════════════════════╗"));
-        logs.push(success("║  ★★ CRITICAL HIT! ★★      ║"));
+        logs.push(success("║  ★★  치명타!  ★★          ║"));
         logs.push(sys("╚════════════════════════════╝"));
       } else if (isFumble) {
         logs.push(sys("╔════════════════════════════╗"));
-        logs.push(err("║  ✗✗ FUMBLE! ✗✗             ║"));
+        logs.push(err("║  ✗✗  실수!  ✗✗             ║"));
         logs.push(sys("╚════════════════════════════╝"));
       } else {
         logs.push(isSuccess ? success(String(r?.message ?? "")) : warn(String(r?.message ?? "")));
       }
 
-      // ── RISK 위기 사고 ──
+      // ── 위험 사고 ──
       if (incident) {
         logs.push(sys("╔══════════════════════════════════════════╗"));
-        logs.push(err(`║  ⚠ RISK INCIDENT!  ${incident.message.slice(0, 22).padEnd(22)}║`));
-        logs.push(err(`║  TIME${String(incident.time_delta).padStart(4)}  RISK+${String(incident.risk_delta).padEnd(2)}                    ║`));
+        logs.push(err(`║  ⚠ 위험 사고!  ${incident.message.slice(0, 26).padEnd(26)}║`));
+        logs.push(err(`║  시간${String(incident.time_delta).padStart(4)}  위험+${String(incident.risk_delta).padEnd(2)}                      ║`));
         logs.push(sys("╚══════════════════════════════════════════╝"));
       }
 
@@ -374,17 +379,17 @@ export async function executeCommand(
 
       // ── XP 정보 ──
       if (r?.xp_granted) {
-        const multStr = xpMultiplier > 1.0 ? `  (x${xpMultiplier} STREAK 보너스)` : "";
-        logs.push(success(`XP 획득: ${JSON.stringify(r.xp_granted)}${multStr}`));
+        const multStr = xpMultiplier > 1.0 ? `  (x${xpMultiplier} 연속 보너스)` : "";
+        logs.push(success(`XP 획득: ${formatXPGrant(r.xp_granted as Record<string, unknown>)}${multStr}`));
       }
 
       // ── 신규 효과 알림 ──
       if (newEffects.length > 0) {
         const NEW_EFFECT_LABEL: Record<string, string> = {
-          flow_state:          "→ FLOW STATE 진입! 성공률 ↑ (3턴)",
-          tired:               "→ TIRED 부여 fumble 위험 ↑ (2턴)",
-          focused:             "→ FOCUSED! QUAL +5/turn (3턴)",
-          guaranteed_critical: "→ 다음 work 자동 CRITICAL 예약!",
+          flow_state:          "→ 몰입 상태 진입! 성공률 ↑ (3턴)",
+          tired:               "→ 피로 부여 실수 위험 ↑ (2턴)",
+          focused:             "→ 집중! 품질 +5/턴 (3턴)",
+          guaranteed_critical: "→ 다음 work 자동 치명타 예약!",
         };
         for (const e of newEffects) {
           const label = NEW_EFFECT_LABEL[e.type] ?? `→ ${e.type}`;
@@ -397,12 +402,24 @@ export async function executeCommand(
       if (activeEffects.length > 0) logs.push(...formatActiveEffects(activeEffects));
 
       // ── 페이즈 진행 배너 ──
+      // ── 부채 압박 경고 ──
+      if (r?.debt_pressure) {
+        logs.push(warn("  ⚠ 기술 부채 압박! 시간 -2 추가 소모 (부채 30+)"));
+      }
+
+      // ── 품질 위기 경고 ──
+      if (r?.quality_crisis) {
+        logs.push(warn("  ⚠ 코드 품질 위기! 품질 20 미만 — 성공률 하락 중"));
+      }
+
       if (r?.phase_advanced && r?.new_phase) {
         logs.push(...formatPhaseBanner(String(r.old_phase ?? ""), String(r.new_phase)));
       }
       if (r?.auto_completed) {
-        context.onStateUpdate?.();
         logs.push(success("★ 모든 페이즈 클리어! 런 자동 완료"));
+        if (r?.completion_bonus_credits) {
+          logs.push(info(`완주 보너스: +${r.completion_bonus_credits}cr 지급`));
+        }
       }
 
       return { logs, autoRefresh: true };
@@ -430,12 +447,23 @@ export async function executeCommand(
         code: args[0],
       });
       if (!res.ok) return { logs: [err(res.error ?? "파티 커맨드 실패")] };
-      return { logs: [info(JSON.stringify(res.data))] };
+      const pd = res.data as Record<string, unknown> | undefined;
+      const partyLogs: LogLine[] = [];
+      if (pd?.message) partyLogs.push(success(String(pd.message)));
+      if (pd?.party_id)  partyLogs.push(info(`파티 ID: ${String(pd.party_id).slice(0, 8)}...`));
+      if (pd?.code)      partyLogs.push(info(`파티 코드: ${pd.code}  (party join ${pd.code} 로 참여)`));
+      if (pd?.member_count !== undefined) partyLogs.push(info(`파티원: ${pd.member_count}명`));
+      if (!partyLogs.length) partyLogs.push(success(`파티 ${subcommand} 완료`));
+      return { logs: partyLogs, autoRefresh: true };
     }
 
     // ──────────── raid ────────────
     case "raid": {
       if (subcommand === "start") {
+        // 동시 진행 방지: 솔로 런 중에는 레이드 불가
+        if (context.activeRunId) {
+          return { logs: [err("솔로 런이 진행 중입니다. 먼저 런을 종료하세요. (run end)")] };
+        }
         const mode = (flags.mode as string) ?? "incident";
         const tier = flags.tier ? parseInt(String(flags.tier)) : 1;
         const scenarioKey = (flags.scenario as string) ?? (mode === "incident" ? "PAYMENT_OUTAGE" : "GRAND_LAUNCH");
@@ -467,13 +495,17 @@ export async function executeCommand(
           idempotency_key: idempotencyKey,
         });
         if (!raidRes.ok) return { logs: [err(raidRes.error ?? "레이드 참여 실패")] };
-        context.onStateUpdate?.();
+        const joinResult = raidRes.data?.result as Record<string, unknown> | undefined;
+        const joinActions = (joinResult?.available_actions ?? []) as RaidAction[];
         return {
           logs: [
             ...prologLogs,
-            success(raidRes.data?.result?.message),
-            info(`레이드 ID: ${raidRes.data?.result?.raid_id}`),
+            success(String(joinResult?.message ?? "레이드 시작")),
+            info(`레이드 ID: ${String(joinResult?.raid_id ?? "")}`),
+            ...formatRaidActionMenu(joinActions),
           ],
+          quickMode: buildRaidQuickMode(joinActions),
+          autoRefresh: true,
         };
       }
 
@@ -490,22 +522,101 @@ export async function executeCommand(
         });
         if (!res.ok) return { logs: [err(res.error ?? "레이드 액션 실패")] };
         const r = res.data?.result as Record<string, unknown> | undefined;
-        const kpi = r?.kpi as Record<string, number> | undefined;
-        const isVictory = r?.victory as boolean | undefined;
+        const kpi = r?.kpi as Record<string, unknown> | undefined;
+        const isVictory  = r?.victory     as boolean | undefined;
+        const isCritical = r?.is_critical as boolean | undefined;
+        const isBackfire = r?.is_backfire as boolean | undefined;
+        const isCombo    = r?.is_combo    as boolean | undefined;
+        const roll       = r?.roll        as number  | undefined;
+        const nextActions = (r?.available_actions ?? []) as RaidAction[];
+        const newlyFiredEvents = (r?.newly_fired_events ?? []) as Array<{
+          title: string; description: string; severity: number;
+        }>;
 
-        // 레이드 승리 → 파티 자동 탈퇴 + 상태 갱신
+        // 레이드 승리 → 파티 자동 탈퇴 (onStateUpdate 제거 — autoRefresh로 일원화)
         if (isVictory) {
           await callAPI("/api/commands", { action: "party_leave" });
-          context.onStateUpdate?.();
         }
 
+        // 판정 롤 애니메이션 (치명타/역효과/성공)
+        const rollLog: LogLine | null = roll !== undefined ? {
+          timestamp: new Date().toISOString(),
+          level: "roll",
+          message: "레이드 판정",
+          data: {
+            roll,
+            threshold: 0.85,           // crit 임계값
+            isCritical: !!isCritical,
+            isFumble:   !!isBackfire,
+            isSuccess:  !isBackfire,
+          },
+        } : null;
+
+        // 타임드 이벤트 로그 (심각도별 드라마틱 표시)
+        const eventLogs: LogLine[] = [];
+        for (const evt of newlyFiredEvents) {
+          if (evt.severity >= 5) {
+            // 긴급 이벤트 — 눈에 띄는 경계
+            eventLogs.push(sys("╔══════════════ ⚡ 긴급 이벤트 ══════════════╗"));
+            eventLogs.push({ timestamp: new Date().toISOString(), level: "error", message: `  ${evt.title}` });
+            eventLogs.push({ timestamp: new Date().toISOString(), level: "warn",  message: `  ${evt.description}` });
+            eventLogs.push(sys("╚═══════════════════════════════════════════╝"));
+          } else if (evt.severity >= 4) {
+            eventLogs.push({ timestamp: new Date().toISOString(), level: "error", message: `⚡ [이벤트] ${evt.title}` });
+            eventLogs.push({ timestamp: new Date().toISOString(), level: "warn",  message: `   ${evt.description}` });
+          } else if (evt.severity >= 3) {
+            eventLogs.push({ timestamp: new Date().toISOString(), level: "warn",  message: `⚡ [이벤트] ${evt.title} — ${evt.description}` });
+          } else {
+            eventLogs.push({ timestamp: new Date().toISOString(), level: "info",  message: `○ [이벤트] ${evt.title} — ${evt.description}` });
+          }
+        }
+
+        // 콤보 보너스 로그
+        const comboLog: LogLine | null = isCombo
+          ? { timestamp: new Date().toISOString(), level: "success", message: "🔗 콤보 연계! 효율 +30%" }
+          : null;
+
+        // 역효과 경고
+        const backfireLog: LogLine | null = isBackfire
+          ? { timestamp: new Date().toISOString(), level: "error", message: "💥 역효과! 조치가 상황을 악화시켰습니다!" }
+          : null;
+
+        // 치명적 성공 메시지
+        const critLog: LogLine | null = isCritical
+          ? { timestamp: new Date().toISOString(), level: "success", message: "⚡ 치명적 성공! 효율 2배!" }
+          : null;
+
+        // KPI display — 비공개 키(_cooldowns 등) 제외
+        const publicKpi: Record<string, number> = {};
+        if (kpi) {
+          for (const [k, v] of Object.entries(kpi)) {
+            if (!k.startsWith("_") && typeof v === "number") publicKpi[k] = v;
+          }
+        }
+
+        const resultLogs: LogLine[] = [
+          ...(rollLog ? [rollLog] : []),
+          ...(backfireLog ? [backfireLog] : []),
+          ...(critLog ? [critLog] : []),
+          ...(comboLog ? [comboLog] : []),
+          info(String(r?.message ?? "")),
+          ...eventLogs,
+          ...(Object.keys(publicKpi).length ? formatKPIDisplay(publicKpi) : []),
+          ...(isVictory
+            ? [
+                success("★ 레이드 클리어! 파티를 자동 해산합니다."),
+                ...(r?.victory_credits ? [info(`보상: +${r.victory_credits}cr 지급`)] : []),
+                sys("──────────────────────────────"),
+              ]
+            : formatRaidActionMenu(nextActions)
+          ),
+        ];
+
         return {
-          logs: [
-            info(String(r?.message ?? "")),
-            ...(kpi ? formatKPIDisplay(kpi) : []),
-            ...(isVictory ? [success("★ 레이드 클리어! 파티를 자동 해산합니다."), sys("──────────────────────────────")] : []),
-          ],
-          autoRefresh: true,   // KPI + 레이드 상태 즉시 반영
+          logs: resultLogs,
+          quickMode: isVictory ? null : buildRaidQuickMode(nextActions),
+          autoRefresh: true,
+          data: isVictory ? { raidEnded: true } : undefined,
         };
       }
 
@@ -553,24 +664,116 @@ export async function executeCommand(
       const mode = (flags.mode as string) ?? "golf";
       const tier = flags.tier ? parseInt(String(flags.tier)) : 1;
 
+      // ── queue ──
       if (subcommand === "queue") {
+        if (context.activePvpMatchId) {
+          return { logs: [err("이미 PvP 매치가 진행 중입니다. pvp status 로 확인하세요.")] };
+        }
+        if (context.activeRunId) {
+          return { logs: [err("솔로 런이 진행 중입니다. run end 후 pvp queue 하세요.")] };
+        }
+        if (context.activeRaidId) {
+          return { logs: [err("레이드가 진행 중입니다. 레이드 종료 후 pvp queue 하세요.")] };
+        }
         const res = await callAPI("/api/pvp-submit", { action: "queue", mode, tier });
         if (!res.ok) return { logs: [err(res.error ?? "PvP 큐 참여 실패")] };
-        return { logs: [info(JSON.stringify(res.data))] };
+        const qd = res.data as Record<string, unknown>;
+        const matchId = String(qd.match_id ?? "");
+        const matched = qd.matched as boolean;
+        return {
+          logs: [
+            success(String(qd.message ?? `PvP 큐 등록 완료 (${mode} Tier ${tier})`)),
+            info(`참여 인원: ${qd.participants ?? 1}명`),
+            sys("─".repeat(48)),
+            matched
+              ? info("  상대방과 매칭되었습니다!")
+              : info("  상대방 대기 중 — 솔로 플레이로도 점수 제출 가능합니다"),
+            info("  ① run start  로 런을 시작하세요"),
+            info("  ② 런 완료 후  pvp submit  으로 점수를 제출하세요"),
+            sys("─".repeat(48)),
+          ],
+          data: { pvpMatchId: matchId },
+        };
       }
 
+      // ── submit ──
       if (subcommand === "submit") {
-        if (!context.activeRunId) return { logs: [err("제출할 런이 없습니다")] };
+        if (!context.activePvpMatchId) return { logs: [err("진행 중인 PvP 매치가 없습니다. pvp queue 먼저 실행하세요.")] };
+        if (!context.activeRunId)      return { logs: [err("완료된 런이 없습니다. run start → 런 진행 → run end 후 제출하세요.")] };
         const res = await callAPI("/api/pvp-submit", {
           action: "submit",
-          run_id: context.activeRunId,
+          match_id: context.activePvpMatchId,
+          run_id:   context.activeRunId,
           idempotency_key: idempotencyKey,
         });
         if (!res.ok) return { logs: [err(res.error ?? "PvP 제출 실패")] };
-        return { logs: [success(`점수: ${res.data?.result?.score}`)] };
+        const r = res.data?.result as Record<string, unknown> | undefined;
+        const score   = Number(r?.score   ?? 0);
+        const bd      = r?.breakdown as Record<string, unknown> | undefined;
+        const isGolf  = mode === "golf" || String(r?.mode) === "golf";
+        const pvpCredits = r?.credits_earned as number | undefined;
+        return {
+          logs: [
+            success(`★ PvP 제출 완료!`),
+            info(`최종 점수: ${score}점`),
+            ...(pvpCredits ? [info(`보상: +${pvpCredits}cr 지급`)] : []),
+            sys("── 성적표 ─────────────────────────────────────"),
+            isGolf
+              ? info(`  커맨드 수: ${bd?.cmd_count}  품질: ${bd?.quality}  부채: ${bd?.debt}  시간: ${bd?.elapsed_sec}초`)
+              : info(`  소요 시간: ${bd?.elapsed_sec}초  품질: ${bd?.quality}  부채: ${bd?.debt}`),
+            sys(`  제출 ${r?.submitted_count}/${r?.total_entries}명`),
+            r?.match_completed ? success("  모든 참여자 제출 완료 — 매치 종료!") : info("  상대방 제출 대기 중..."),
+            sys("─".repeat(48)),
+          ],
+          data: { pvpEnded: true },
+          autoRefresh: true,
+        };
       }
 
-      return { logs: [err(`알 수 없는 pvp 서브커맨드: ${subcommand}`)] };
+      // ── status ──
+      if (subcommand === "status") {
+        const res = await callAPI("/api/pvp-submit", { action: "pvp_status" });
+        if (!res.ok) return { logs: [err(res.error ?? "PvP 상태 조회 실패")] };
+        const e = res.data?.entry as Record<string, unknown> | null;
+        if (!e) return { logs: [info("진행 중인 PvP 매치가 없습니다.")] };
+        const modeLabel = String(e.mode) === "golf" ? "Code Golf" : "Speedrun";
+        const statusLabel: Record<string, string> = { queuing: "대기 중", active: "진행 중", completed: "종료" };
+        return {
+          logs: [
+            sys("━━ PvP 매치 현황 ━━"),
+            info(`모드: ${modeLabel}  Tier: ${e.tier}  상태: ${statusLabel[String(e.status)] ?? e.status}`),
+            info(`참여: ${e.submitted_count}/${e.total_entries}명 제출`),
+            e.my_score !== null
+              ? success(`내 점수: ${e.my_score}점 (제출 완료)`)
+              : info("아직 제출하지 않았습니다"),
+          ],
+        };
+      }
+
+      // ── leaderboard ──
+      if (subcommand === "leaderboard") {
+        const lbMode = (flags.mode as string) ?? "golf";
+        const res = await callAPI("/api/pvp-submit", { action: "pvp_leaderboard", mode: lbMode });
+        if (!res.ok) return { logs: [err(res.error ?? "리더보드 조회 실패")] };
+        const rows = (res.data?.leaderboard ?? []) as Array<{
+          rank: number; name: string; total_score: number; match_count: number;
+        }>;
+        const modeLabel = lbMode === "golf" ? "Code Golf" : "Speedrun";
+        return {
+          logs: [
+            sys(`━━ PvP 리더보드 — ${modeLabel} [${res.data?.season ?? "현재 시즌"}] ━━`),
+            sys(`  ${"순위".padEnd(4)}  ${"캐릭터".padEnd(16)}  ${"누적 점수".padEnd(10)}  경기 수`),
+            sys("─".repeat(48)),
+            ...(rows.length
+              ? rows.map((r) =>
+                  info(`  ${String(r.rank).padEnd(4)}  ${r.name.padEnd(16)}  ${String(r.total_score).padEnd(10)}  ${r.match_count}경기`)
+                )
+              : [info("  기록이 없습니다")]),
+          ],
+        };
+      }
+
+      return { logs: [err(`알 수 없는 pvp 서브커맨드: ${subcommand ?? "(없음)"}. pvp queue|submit|status|leaderboard`)] };
     }
 
     // ──────────── market ────────────
@@ -627,6 +830,88 @@ export async function executeCommand(
       });
       if (!res.ok) return { logs: [err(res.error ?? "납품 실패")] };
       return { logs: [success(res.data?.result?.message)] };
+    }
+
+    // ──────────── say (레이드 채팅) ────────────
+    case "say": {
+      if (!context.activeRaidId) return { logs: [err("레이드 중에만 채팅 가능합니다")] };
+      const text = [subcommand, ...args].filter(Boolean).join(" ");
+      if (!text.trim()) return { logs: [err("메시지를 입력하세요")] };
+      const res = await callAPI("/api/raid-command", {
+        action: "chat",
+        raid_id: context.activeRaidId,
+        message: text.trim(),
+        idempotency_key: idempotencyKey,
+      });
+      if (!res.ok) return { logs: [err(res.error ?? "채팅 전송 실패")] };
+      return { logs: [] }; // Realtime으로 표시됨
+    }
+
+    // ──────────── cc (커뮤니티 채팅) ────────────
+    case "cc": {
+      const text = [subcommand, ...args].filter(Boolean).join(" ");
+      if (!text.trim()) {
+        return {
+          logs: [sys("── COMMUNITY 패널 열기 ──")],
+          data: { openCommunity: true },
+        };
+      }
+      const res = await callAPI("/api/community", { action: "chat", message: text.trim() });
+      if (!res.ok) return { logs: [err(res.error ?? "전송 실패")] };
+      return {
+        logs: [info(`[커뮤] ${text.trim()}`)],
+        data: { openCommunity: true },
+      };
+    }
+
+    // ──────────── community ────────────
+    case "community": {
+      return {
+        logs: [sys("── COMMUNITY 패널을 열었습니다 ──")],
+        data: { openCommunity: true },
+      };
+    }
+
+    // ──────────── friend ────────────
+    case "friend": {
+      if (!subcommand || subcommand === "list") {
+        const res = await callAPI("/api/community", { action: "friend_list" });
+        if (!res.ok) return { logs: [err(res.error ?? "조회 실패")] };
+        const friends = (res.data?.friends ?? []) as Array<{ name: string }>;
+        const requests = (res.data?.requests ?? []) as Array<{ name: string }>;
+        const logs: LogLine[] = [sys("━━ 친구 목록 ━━")];
+        if (friends.length === 0) {
+          logs.push(info("  친구가 없습니다"));
+        } else {
+          for (const f of friends) logs.push(info(`  ● ${f.name}`));
+        }
+        if (requests.length > 0) {
+          logs.push(sys("── 받은 요청 ──"));
+          for (const r of requests) {
+            logs.push(info(`  ${r.name}  (friend accept ${r.name} 으로 수락)`));
+          }
+        }
+        return { logs };
+      }
+      if (subcommand === "add") {
+        const name = args[0] ?? "";
+        if (!name) return { logs: [err("사용법: friend add <캐릭터명>")] };
+        const res = await callAPI("/api/community", { action: "friend_add", name });
+        return { logs: [res.ok ? success(String(res.data?.message ?? "요청 전송")) : err(res.error ?? "실패")] };
+      }
+      if (subcommand === "accept") {
+        const name = args[0] ?? "";
+        if (!name) return { logs: [err("사용법: friend accept <캐릭터명>")] };
+        const res = await callAPI("/api/community", { action: "friend_accept", name });
+        return { logs: [res.ok ? success(String(res.data?.message ?? "수락")) : err(res.error ?? "실패")] };
+      }
+      if (subcommand === "remove") {
+        const name = args[0] ?? "";
+        if (!name) return { logs: [err("사용법: friend remove <캐릭터명>")] };
+        const res = await callAPI("/api/community", { action: "friend_remove", name });
+        return { logs: [res.ok ? success(String(res.data?.message ?? "삭제")) : err(res.error ?? "실패")] };
+      }
+      return { logs: [err("사용법: friend <list|add|accept|remove> [이름]")] };
     }
 
     // ──────────── shop ────────────
@@ -767,6 +1052,25 @@ const sys = (msg: string) => log("system", msg);
 
 // ──────────── 로컬 타입 ────────────
 type ActiveEffect = { type: string; magnitude: number; turns_left: number };
+type RaidAction = {
+  action_key: string;
+  label: string;
+  description?: string;
+  kpi_effect?: Record<string, number>;
+  position_bonus?: Record<string, number>;
+  cooldown_sec?: number;
+  cooldown_remaining?: number;
+  is_ready?: boolean;
+};
+
+// ──────────── 페이즈 한글 매핑 ────────────
+const PHASE_KO: Record<string, string> = {
+  plan:      "기획",
+  implement: "구현",
+  test:      "테스트",
+  deploy:    "배포",
+  operate:   "운영",
+};
 
 // ──────────── UI 헬퍼: ASCII 바 ────────────
 
@@ -777,8 +1081,8 @@ function bar(value: number, max: number, width = 10): string {
 
 function formatResourceBars(r: { time: number; risk: number; debt: number; quality: number }): LogLine[] {
   return [
-    info(`TIME  [${bar(r.time, 100)}] ${String(r.time).padStart(3)}  RISK  [${bar(r.risk, 100)}] ${String(r.risk).padStart(3)}`),
-    info(`QUAL  [${bar(r.quality, 100)}] ${String(r.quality).padStart(3)}  DEBT  [${bar(r.debt, 50)}]  ${String(r.debt).padStart(2)}`),
+    info(`시간  [${bar(r.time, 100)}] ${String(r.time).padStart(3)}  위험  [${bar(r.risk, 100)}] ${String(r.risk).padStart(3)}`),
+    info(`품질  [${bar(r.quality, 100)}] ${String(r.quality).padStart(3)}  부채  [${bar(r.debt, 50)}]  ${String(r.debt).padStart(2)}`),
   ];
 }
 
@@ -828,7 +1132,8 @@ function formatDrawHand(data: Record<string, unknown> | undefined): LogLine[] {
   }>;
   const labels = ["A", "B", "C"];
   const hr = "─".repeat(52);
-  const headerLabel = `TICKET HAND (phase: ${phase})`;
+  const phaseKo = PHASE_KO[phase] ?? phase;
+  const headerLabel = `티켓 패 (페이즈: ${phaseKo})`;
   const headerPad = Math.max(0, 52 - 4 - headerLabel.length);
   const lines: LogLine[] = [
     sys(`┌── ${headerLabel} ${"─".repeat(headerPad)}┐`),
@@ -837,7 +1142,7 @@ function formatDrawHand(data: Record<string, unknown> | undefined): LogLine[] {
     const rdStr = ticket.base_risk_delta >= 0 ? `+${ticket.base_risk_delta}` : String(ticket.base_risk_delta);
     const qdStr = ticket.base_quality_delta >= 0 ? `+${ticket.base_quality_delta}` : String(ticket.base_quality_delta);
     lines.push(info(`│  [${labels[i]}] ${ticket.ticket_key.padEnd(16)} ${ticket.title}`));
-    lines.push(info(`│      TIME:-${ticket.base_time_cost}  RISK:${rdStr}  QUAL:${qdStr}  [${ticket.position_tag}]`));
+    lines.push(info(`│      시간:-${ticket.base_time_cost}  위험:${rdStr}  품질:${qdStr}  [${ticket.position_tag}]`));
     if (i < hand.length - 1) lines.push(sys(`├${hr}┤`));
   });
   lines.push(sys(`└${hr}┘`));
@@ -846,16 +1151,16 @@ function formatDrawHand(data: Record<string, unknown> | undefined): LogLine[] {
 }
 
 function formatPhaseBanner(from: string, to: string): LogLine[] {
-  const fromU = from.toUpperCase();
-  const toU = to.toUpperCase();
+  const fromKo = PHASE_KO[from.toLowerCase()] ?? from.toUpperCase();
+  const toKo = PHASE_KO[to.toLowerCase()] ?? to.toUpperCase();
   const arrow = ` ──────────→ `;
-  const inner = `    ${fromU}${arrow}${toU}`;
+  const inner = `    ${fromKo}${arrow}${toKo}`;
   const width = Math.max(46, inner.length + 4);
   const hr = "═".repeat(width);
   const pad = (s: string) => s.padEnd(width - 2);
   return [
     sys(`╔${hr}╗`),
-    sys(`║  ${pad("★ PHASE COMPLETE!")}║`),
+    sys(`║  ${pad("★ 페이즈 완료!")}║`),
     sys(`║  ${pad(inner)}║`),
     sys(`╚${hr}╝`),
   ];
@@ -878,10 +1183,12 @@ function formatKPIDisplay(kpi: Record<string, number>): LogLine[] {
 function formatActiveEffects(effects: ActiveEffect[]): LogLine[] {
   if (!effects || effects.length === 0) return [];
   const LABELS: Record<string, string> = {
-    flow_state:          "FLOW STATE         (성공률 ↑ +15%)",
-    tired:               "TIRED              (fumble 위험 ↑ +5%)",
-    focused:             "FOCUSED            (QUAL +5/turn)",
-    guaranteed_critical: "GUARANTEED CRIT ★  (다음 work 자동 CRITICAL)",
+    flow_state:          "몰입 상태          (성공률 ↑ +15%)",
+    tired:               "피로               (실수 위험 ↑ +5%)",
+    focused:             "집중               (품질 +5/턴)",
+    guaranteed_critical: "보장 치명타 ★      (다음 work 자동 치명타)",
+    risk_shield:         "위험 방어막        (사고 차단)",
+    success_boost:       "성공 부스트        (성공률 ↑)",
   };
   const colorOf = (type: string) => {
     if (type === "tired") return warn;
@@ -889,18 +1196,18 @@ function formatActiveEffects(effects: ActiveEffect[]): LogLine[] {
     return success;
   };
   return [
-    sys("── ACTIVE EFFECTS ──────────────────────────"),
-    ...effects.map((e) => colorOf(e.type)(`  [${LABELS[e.type] ?? e.type}]  残 ${e.turns_left}턴`)),
+    sys("── 활성 효과 ─────────────────────────────"),
+    ...effects.map((e) => colorOf(e.type)(`  [${LABELS[e.type] ?? e.type}]  잔 ${e.turns_left}턴`)),
   ];
 }
 
 function formatStreakBadge(streak: number, streakMessages: string[]): LogLine[] {
   if (streak < 2) return [];
   const badge =
-    streak >= 10 ? `★★★ UNSTOPPABLE  STREAK x${streak} ★★★` :
-    streak >= 5  ? `★★ ON FIRE!  STREAK x${streak} ★★` :
-    streak >= 3  ? `★ STREAK x${streak}` :
-                   `STREAK x${streak}`;
+    streak >= 10 ? `★★★ 무아지경!  연속 x${streak} ★★★` :
+    streak >= 5  ? `★★ 불타오른다!  연속 x${streak} ★★` :
+    streak >= 3  ? `★ 연속 x${streak}` :
+                   `연속 x${streak}`;
   const lines: LogLine[] = [success(`  ${badge}`)];
   for (const msg of streakMessages) lines.push(success(`  ${msg}`));
   return lines;
@@ -909,9 +1216,9 @@ function formatStreakBadge(streak: number, streakMessages: string[]): LogLine[] 
 function formatRiskDangerZone(risk: number): LogLine[] {
   if (risk < 50) return [];
   const level =
-    risk >= 90 ? err(`  ⚠ DANGER ZONE! RISK ${risk} — 사고 확률 20%`) :
-    risk >= 70 ? warn(`  ⚠ HIGH RISK  RISK ${risk} — 사고 확률 8%`) :
-                 warn(`  ⚠ RISK ${risk} — 사고 확률 3%`);
+    risk >= 90 ? err(`  ⚠ 위험 구역! 위험도 ${risk} — 사고 확률 20%`) :
+    risk >= 70 ? warn(`  ⚠ 고위험  위험도 ${risk} — 사고 확률 8%`) :
+                 warn(`  ⚠ 위험도 ${risk} — 사고 확률 3%`);
   return [level];
 }
 
@@ -933,7 +1240,7 @@ function formatStatus(data: Record<string, unknown> | undefined): LogLine[] {
       quality: Number(run.quality),
     };
     logs.push(sys("━━ 활성 런 ━━"));
-    logs.push(info(`페이즈: ${run.phase}  상태: ${run.status}`));
+    logs.push(info(`페이즈: ${PHASE_KO[String(run.phase)] ?? run.phase}  상태: ${run.status}`));
     logs.push(...formatResourceBars(resources));
   } else {
     logs.push(info("활성 런 없음 (run start로 시작)"));
@@ -992,7 +1299,7 @@ function formatRunStatus(data: Record<string, unknown> | undefined): LogLine[] {
   };
   return [
     sys("━━ 런 상태 ━━"),
-    info(`페이즈: ${r.phase}  티어: ${r.tier}`),
+    info(`페이즈: ${PHASE_KO[String(r.phase)] ?? r.phase}  티어: ${r.tier}`),
     ...formatResourceBars(resources),
     info(`커맨드 수: ${r.cmd_count}`),
   ];
@@ -1144,4 +1451,81 @@ function formatContractList(data: Record<string, unknown> | undefined): LogLine[
       )
     ),
   ];
+}
+
+// ──────────── XP 표시 파서 ────────────
+function formatXPGrant(xpGranted: Record<string, unknown>): string {
+  const parts: string[] = [];
+  const pos = xpGranted.position as Record<string, number> | undefined;
+  const core = xpGranted.core as Record<string, number> | undefined;
+  if (pos) {
+    for (const [k, v] of Object.entries(pos)) parts.push(`${k} +${v}`);
+  }
+  if (core) {
+    for (const [k, v] of Object.entries(core)) parts.push(`${k} +${v}`);
+  }
+  return parts.length ? parts.join("  ") : "0";
+}
+
+// ──────────── 레이드 KPI 효과 요약 ────────────
+function formatKPIEffect(kpiEffect: Record<string, number>): string {
+  const parts: string[] = [];
+  if (kpiEffect.error_rate_reduce)  parts.push(`에러↓${kpiEffect.error_rate_reduce}`);
+  if (kpiEffect.success_rate_add)   parts.push(`성공↑${kpiEffect.success_rate_add}`);
+  if (kpiEffect.latency_reduce)     parts.push(`지연↓${kpiEffect.latency_reduce}`);
+  if (kpiEffect.deploy_health_add)  parts.push(`배포↑${kpiEffect.deploy_health_add}`);
+  return parts.join(" ");
+}
+
+// ──────────── 레이드 액션 메뉴 (쿨다운 표시) ────────────
+function formatRaidActionMenu(actions: RaidAction[]): LogLine[] {
+  if (!actions.length) return [];
+
+  const readyActions = actions.filter((a) => a.is_ready !== false && (a.cooldown_remaining ?? 0) === 0);
+  const lines: LogLine[] = [sys("── 가용 액션 ─────────────────────────────────────")];
+
+  let readyIdx = 0;
+  for (const a of actions) {
+    const effect = formatKPIEffect(a.kpi_effect ?? {});
+    const isReady = a.is_ready !== false && (a.cooldown_remaining ?? 0) === 0;
+    if (isReady) {
+      readyIdx++;
+      lines.push(info(`  [${readyIdx}] ${a.label.padEnd(18)} ${effect}`));
+    } else {
+      lines.push(sys(`  [ ] ${a.label.padEnd(18)} ⏱ ${a.cooldown_remaining}초`));
+    }
+  }
+  lines.push(sys("──────────────────────────────────────────────────"));
+
+  // 준비된 액션만 인터랙티브 버튼으로
+  if (readyActions.length > 0) {
+    const interactive: LogLine = {
+      timestamp: new Date().toISOString(),
+      level: "interactive",
+      message: "레이드 액션",
+      data: {
+        type: "choices",
+        items: readyActions.map((a, i) => ({
+          label: a.label,
+          command: `raid action ${a.action_key}`,
+          meta: formatKPIEffect(a.kpi_effect ?? {}),
+          key: String(i + 1),
+        })),
+      },
+    };
+    lines.push(interactive);
+  } else {
+    lines.push(sys("  ⏳ 모든 액션 쿨다운 중 — 잠시 후 재시도하세요"));
+  }
+  return lines;
+}
+
+// ──────────── 레이드 QuickMode 빌더 (준비된 액션만) ────────────
+function buildRaidQuickMode(actions: RaidAction[]): QuickMode | null {
+  const readyActions = actions.filter((a) => a.is_ready !== false && (a.cooldown_remaining ?? 0) === 0);
+  if (!readyActions.length) return null;
+  const map: Record<string, string> = {};
+  readyActions.forEach((a, i) => { map[String(i + 1)] = `raid action ${a.action_key}`; });
+  const hint = readyActions.slice(0, 5).map((a, i) => `${i + 1}:${a.label}`).join("  ");
+  return { hint, map };
 }

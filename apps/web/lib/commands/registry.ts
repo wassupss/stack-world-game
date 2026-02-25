@@ -8,7 +8,7 @@ export interface CommandDef {
   syntax: string;
   description: string;
   examples: string[];
-  category: "common" | "solo" | "party" | "raid" | "pvp" | "market" | "shop";
+  category: "common" | "solo" | "party" | "raid" | "pvp" | "market" | "shop" | "community";
   unlockLevel?: number; // 특정 레벨 이상에서만 표시
 }
 
@@ -139,17 +139,26 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     ],
     category: "raid",
   },
+  {
+    name: "say",
+    syntax: "say <메시지>",
+    description: "레이드 파티원에게 채팅 메시지 전송 (레이드 중에만 가능)",
+    examples: ["say 안녕하세요!", "say 롤백 먼저 시도할게요", "say 에러율 거의 다 됐어요!"],
+    category: "raid",
+  },
 
   // ──────────── PvP ────────────
   {
     name: "pvp",
-    syntax: "pvp <queue|status|submit> [--mode golf|speedrun] [--tier N]",
-    description: "PvP 매치 관리. golf=커맨드 수 최소화, speedrun=최단 시간",
+    syntax: "pvp <queue|status|submit|leaderboard> [--mode golf|speedrun] [--tier N]",
+    description: "PvP 점수 경쟁. golf=최소 커맨드, speedrun=최단 시간. 솔로 플레이도 가능",
     examples: [
       "pvp queue --mode golf --tier 1",
       "pvp queue --mode speedrun",
       "pvp status",
       "pvp submit",
+      "pvp leaderboard",
+      "pvp leaderboard --mode speedrun",
     ],
     category: "pvp",
   },
@@ -211,6 +220,34 @@ export const COMMAND_REGISTRY: CommandDef[] = [
     description: "계약 납품. 보유 아티팩트로 계약 이행",
     examples: ["deliver <contract_id>"],
     category: "market",
+  },
+
+  // ──────────── 커뮤니티 ────────────
+  {
+    name: "community",
+    syntax: "community",
+    description: "커뮤니티 패널 열기 (전역 채팅 + 친구 목록)",
+    examples: ["community"],
+    category: "community",
+  },
+  {
+    name: "cc",
+    syntax: "cc <메시지>",
+    description: "커뮤니티 전역 채팅 전송. 메시지 없이 입력하면 패널 열기",
+    examples: ["cc 안녕하세요!", "cc 레이드 파티 구합니다", "cc"],
+    category: "community",
+  },
+  {
+    name: "friend",
+    syntax: "friend <list|add|accept|remove> [캐릭터명]",
+    description: "친구 관계 관리. list로 친구/요청 확인, add로 친구 요청",
+    examples: [
+      "friend list",
+      "friend add DevKim",
+      "friend accept DevKim",
+      "friend remove DevKim",
+    ],
+    category: "community",
   },
 ];
 

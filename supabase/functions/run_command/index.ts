@@ -225,6 +225,24 @@ async function handleStart(
     return json({ error: "이미 진행 중인 런이 있습니다. 먼저 종료하세요." }, 400);
   }
 
+  // 진행 중인 레이드가 있으면 거부
+  const { data: activeMembership } = await db
+    .from("party_members")
+    .select("party_id")
+    .eq("character_id", character.id)
+    .single();
+  if (activeMembership) {
+    const { data: activeRaid } = await db
+      .from("raids")
+      .select("id")
+      .eq("party_id", activeMembership.party_id)
+      .in("status", ["waiting", "active"])
+      .single();
+    if (activeRaid) {
+      return json({ error: "레이드가 진행 중입니다. 먼저 레이드를 완료하거나 탈퇴하세요." }, 400);
+    }
+  }
+
   // seed 생성 (유저 기반 + 타임스탬프)
   const seed = `${character.id}-${Date.now()}`;
 
@@ -658,10 +676,15 @@ async function handleWork(
   const hasGuaranteedCritical = activeEffects.some((e) => e.type === "guaranteed_critical");
   const hasRiskShield = activeEffects.some((e) => e.type === "risk_shield");
 
-  // ── 임계값 계산 (effects + streak + 업그레이드 + 수식어 반영) ──
+  // ── 위기 상태 판정 (임계값 계산 전에 미리) ──
+  const debtPressure = run.debt >= 30;    // 기술 부채 압박: TIME 추가 소모
+  const qualityCrisis = run.quality < 20; // 품질 위기: 성공률 하락
+
+  // ── 임계값 계산 (effects + streak + 업그레이드 + 수식어 + 위기 반영) ──
   const baseCriticalThreshold = run.current_streak >= 5 ? 0.90 : 0.95;
+  const qualityCrisisPenalty = qualityCrisis ? 0.05 : 0; // 품질 위기: 성공률 -5%
   const thresholds = applyEffectsToThresholds(activeEffects, {
-    successThreshold: Math.max(0.1, 0.7 + bonus.successBonus + modSuccessDelta + upgSuccessThresholdDelta),
+    successThreshold: Math.max(0.1, 0.7 + bonus.successBonus + modSuccessDelta + upgSuccessThresholdDelta + qualityCrisisPenalty),
     criticalThreshold: Math.max(0.5, baseCriticalThreshold + upgCritDelta + modCritDelta),
     fumbleThreshold: Math.max(0, 0.05 + upgFumbleDelta + modFumbleDelta),
   });
@@ -685,16 +708,24 @@ async function handleWork(
   let qualityDelta = isSuccess
     ? ticket.base_quality_delta + bonus.qualityBonus
     : ticket.base_quality_delta - 1;
+  let debtDelta = 0;
+
+  // 부채 압박: DEBT >= 30 → 시간 추가 소모
+  if (debtPressure) timeCost += 2;
 
   // Critical/Fumble 추가 효과
   if (isCritical) {
     timeCost = Math.max(0, timeCost - 3);
     riskDelta -= 2;
     qualityDelta += 5;
+    debtDelta -= 1; // 치명타: 부채 소폭 감소 (깔끔한 코드)
   } else if (isFumble) {
     timeCost += 5;
     riskDelta += 5;
     qualityDelta -= 3;
+    debtDelta += 2; // 실수: 기술 부채 증가 (임시방편)
+  } else if (!isSuccess) {
+    debtDelta += 1; // 일반 실패: 부채 소폭 증가
   }
 
   // ── System 4: 포지션 시너지 ──
@@ -715,13 +746,13 @@ async function handleWork(
 
     if (newPositionStreak >= 5) {
       positionSynergyBonus = 10;
-      positionSynergyMessage = `[${ticket.position_tag} 시너지 x5] QUALITY +10 ★★★`;
+      positionSynergyMessage = `[${ticket.position_tag} 시너지 x5] 품질 +10 ★★★`;
     } else if (newPositionStreak >= 3) {
       positionSynergyBonus = 5;
-      positionSynergyMessage = `[${ticket.position_tag} 시너지 x3] QUALITY +5 ★★`;
+      positionSynergyMessage = `[${ticket.position_tag} 시너지 x3] 품질 +5 ★★`;
     } else if (newPositionStreak >= 2) {
       positionSynergyBonus = 2;
-      positionSynergyMessage = `[${ticket.position_tag} 시너지 x2] QUALITY +2 ★`;
+      positionSynergyMessage = `[${ticket.position_tag} 시너지 x2] 품질 +2 ★`;
     }
     qualityDelta += positionSynergyBonus;
   }
@@ -743,10 +774,10 @@ async function handleWork(
   const newStreak = isSuccess ? (run.current_streak ?? 0) + 1 : 0;
   const streakXpMult = computeStreakXpMult(newStreak);
   const streakMessages: string[] = [];
-  if (newStreak === 3) streakMessages.push("[STREAK x3] XP x1.5!");
-  if (newStreak === 5) streakMessages.push("[STREAK x5] XP x2 + CRITICAL 임계값 강화!");
+  if (newStreak === 3) streakMessages.push("[연속 x3] XP x1.5!");
+  if (newStreak === 5) streakMessages.push("[연속 x5] XP x2 + 치명타 임계값 강화!");
   if (newStreak >= 10 && (newStreak - 10) % 5 === 0) {
-    streakMessages.push(`[STREAK x${newStreak}] 다음 work 자동 CRITICAL 예약!`);
+    streakMessages.push(`[연속 x${newStreak}] 다음 work 자동 치명타 예약!`);
   }
 
   // ── Effects 갱신 ──
@@ -761,7 +792,7 @@ async function handleWork(
   // ── 최종 자원 계산 (커피 셋업: work마다 TIME 회복) ──
   const newTime = Math.max(0, run.time - timeCost + incidentTimeDelta + upgTimeBonusPerWork);
   const newRisk = Math.min(MAX_RISK, Math.max(0, run.risk + riskDelta + incidentRiskDelta));
-  const newDebt = run.debt;
+  const newDebt = Math.min(MAX_DEBT, Math.max(0, run.debt + debtDelta));
   const newQuality = Math.min(100, Math.max(0, run.quality + qualityDelta));
 
   // ── 페이즈 자동 진행 ──
@@ -792,6 +823,7 @@ async function handleWork(
   const updateData: Record<string, unknown> = {
     time: newTime,
     risk: newRisk,
+    debt: newDebt,
     quality: newQuality,
     current_streak: newStreak,
     active_effects: finalEffects,
@@ -812,14 +844,32 @@ async function handleWork(
 
   await db.from("runs").update(updateData).eq("id", run.id);
 
+  // ── 자동완료 보상 (autoCompleted 경로: handleEnd가 호출되지 않으므로 여기서 지급) ──
+  let completionBonusCredits = 0;
+  if (autoCompleted) {
+    const autoScore = Math.max(0, newQuality * 10 - newDebt * 20 + newTime * 2 - newRisk * 5);
+    completionBonusCredits = Math.max(50, Math.floor(autoScore * 0.25) + run.tier * 30);
+    await grantCredits(db, character.id, completionBonusCredits);
+  }
+
   // ── XP 지급 (streak × 업그레이드 × 수식어 배율 적용) ──
   if (isSuccess) {
     const totalXpMult = streakXpMult * (1.0 + upgXpBonus) * modXpMult;
     const scaledXP = scaleRewardXP(ticket.reward_xp, totalXpMult);
     await grantTicketXP(db, character.id, scaledXP);
-    // 크레딧 보상: 기본값의 35%만 지급 (런 완주 보너스는 handleEnd에서 지급)
-    await grantCredits(db, character.id, Math.floor((ticket.reward_items?.credits ?? 0) * 0.35));
+    // mid-run 크레딧 제거 — 보상은 프로젝트 완주 시에만 지급
   }
+
+  // ── 페이즈별 플레이버 메시지 ──
+  const PHASE_FLAVOR: Record<string, { success: string; fail: string; critical: string; fumble: string }> = {
+    plan:      { critical: "완벽한 설계!", success: "기획 완료", fail: "방향이 불분명합니다", fumble: "요구사항 충돌 발생!" },
+    implement: { critical: "깔끔한 구현!", success: "구현 완료", fail: "로직 오류 발생",    fumble: "스택 오버플로우!" },
+    test:      { critical: "전체 통과!",   success: "테스트 통과", fail: "케이스 실패",   fumble: "프로덕션 버그 발견!" },
+    deploy:    { critical: "무결점 배포!", success: "배포 완료", fail: "파이프라인 오류", fumble: "롤백 필요!" },
+    operate:   { critical: "안정적 운영!", success: "모니터링 정상", fail: "지표 이상",   fumble: "장애 발생!" },
+  };
+  const flavor = PHASE_FLAVOR[run.phase] ?? PHASE_FLAVOR.implement;
+  const flavorMsg = isCritical ? flavor.critical : isFumble ? flavor.fumble : isSuccess ? flavor.success : flavor.fail;
 
   const result = {
     ticket_key: input.ticket_key,
@@ -831,10 +881,12 @@ async function handleWork(
     threshold: thresholds.successThreshold.toFixed(3),
     critical_threshold: thresholds.criticalThreshold.toFixed(3),
     fumble_threshold: thresholds.fumbleThreshold.toFixed(3),
-    delta: { time: -timeCost, risk: riskDelta, quality: qualityDelta },
+    delta: { time: -timeCost, risk: riskDelta, debt: debtDelta, quality: qualityDelta },
     incident: incident
       ? { time_delta: incidentTimeDelta, risk_delta: incidentRiskDelta, message: incident.message }
       : null,
+    debt_pressure: debtPressure,
+    quality_crisis: qualityCrisis,
     resources: { time: newTime, risk: newRisk, debt: newDebt, quality: newQuality },
     xp_granted: isSuccess ? ticket.reward_xp : null,
     xp_multiplier: isSuccess ? streakXpMult * (1.0 + upgXpBonus) * modXpMult : 1.0,
@@ -849,13 +901,14 @@ async function handleWork(
     old_phase: run.phase,
     new_phase: phaseAdvanced ? newPhase : null,
     auto_completed: autoCompleted,
+    completion_bonus_credits: autoCompleted ? completionBonusCredits : null,
     message: isCritical
-      ? `[티켓 CRITICAL!] ${input.ticket_key} ★★`
+      ? `[치명타!] ${flavorMsg} — ${input.ticket_key} ★★`
       : isFumble
-      ? `[티켓 FUMBLE!] ${input.ticket_key} ✗✗`
+      ? `[실수!] ${flavorMsg} — ${input.ticket_key} ✗✗`
       : isSuccess
-      ? `[티켓 완료] ${input.ticket_key} ✓`
-      : `[티켓 실패] ${input.ticket_key} ✗`,
+      ? `[완료] ${flavorMsg} — ${input.ticket_key} ✓`
+      : `[실패] ${flavorMsg} — ${input.ticket_key} ✗`,
   };
 
   await logCommand(db, character.id, run.id, "work", input, result, input.idempotency_key);
@@ -973,8 +1026,8 @@ async function handleEnd(
     p_debt_delta: run.debt,
   });
 
-  // 런 완주 보너스 크레딧 (score × 0.15)
-  const completionBonus = Math.floor(score * 0.15);
+  // 런 완주 보너스 크레딧: max(50, score × 0.25 + tier × 30)
+  const completionBonus = Math.max(50, Math.floor(score * 0.25) + run.tier * 30);
   await grantCredits(db, character.id, completionBonus);
 
   const result = {
