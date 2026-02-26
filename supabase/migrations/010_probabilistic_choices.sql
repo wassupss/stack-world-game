@@ -11,7 +11,7 @@ DECLARE
   c2   JSONB;
   new_choices JSONB;
 BEGIN
-  FOR ev IN SELECT id, choices FROM events LOOP
+  FOR ev IN SELECT event_key, choices FROM events LOOP
 
     -- 이미 마이그레이션된 경우 스킵 (risk_level 필드 존재 여부로 판단)
     IF jsonb_typeof(ev.choices) = 'array'
@@ -165,7 +165,7 @@ BEGIN
 
     ); -- end jsonb_build_array
 
-    UPDATE events SET choices = new_choices WHERE id = ev.id;
+    UPDATE events SET choices = new_choices WHERE event_key = ev.event_key;
 
   END LOOP;
 END;
