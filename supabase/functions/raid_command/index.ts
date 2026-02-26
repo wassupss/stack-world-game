@@ -359,13 +359,25 @@ async function handleAction(
     }
   }
 
+  // ── 액션별 확률 프로필 ──
+  const ACTION_RISK_PROFILES: Record<string, { crit: number; back: number }> = {
+    trace:         { crit: 0.20, back: 0.03 }, // 정찰 — 안전
+    alert_tune:    { crit: 0.18, back: 0.04 },
+    cache_bust:    { crit: 0.18, back: 0.06 },
+    canary:        { crit: 0.12, back: 0.05 },
+    quarantine:    { crit: 0.15, back: 0.08 }, // 기본
+    circuit_break: { crit: 0.15, back: 0.08 },
+    scale:         { crit: 0.15, back: 0.10 },
+    patch:         { crit: 0.25, back: 0.12 }, // 핫픽스 — 고위험 고보상
+    rollback:      { crit: 0.20, back: 0.15 },
+  };
+
   // ── 판정 롤 (0 ~ 1) ──
-  // 0.00~0.08: 역효과(backfire)  0.09~0.84: 일반 성공  0.85~1.00: 치명적 성공
+  // 0.00~back: 역효과(backfire)  back~(1-crit): 일반 성공  (1-crit)~1.00: 치명적 성공
   const roll = Math.random();
-  const CRIT_THRESHOLD  = 0.85;
-  const BACK_THRESHOLD  = 0.08;
-  const isCritical = roll >= CRIT_THRESHOLD;
-  const isBackfire = roll <= BACK_THRESHOLD;
+  const profile = ACTION_RISK_PROFILES[input.action_key] ?? { crit: 0.15, back: 0.08 };
+  const isCritical = roll >= (1 - profile.crit);
+  const isBackfire = roll <= profile.back;
 
   // ── 콤보 감지 (_last_action_key 기반) ──
   const lastActionKey = (currentKPIRaw._last_action_key ?? "") as string;
@@ -487,12 +499,13 @@ async function handleAction(
     }, character.id);
   }
 
-  // 다음 액션 목록 (쿨다운 정보 포함)
+  // 다음 액션 목록 (쿨다운 + 확률 정보 포함)
   const updatedCooldownMap = newKPI._cooldowns as Record<string, number>;
   const nextActions = isVictory ? [] : actions.map((a) => {
     const aExpiresAt = updatedCooldownMap[a.action_key] ?? 0;
     const aCooldownMs = (a.cooldown_sec ?? 0) * 1000;
     const remainingSec = Math.max(0, Math.ceil((aExpiresAt - Date.now()) / 1000));
+    const aProfile = ACTION_RISK_PROFILES[a.action_key] ?? { crit: 0.15, back: 0.08 };
     return {
       action_key: a.action_key,
       label: a.label ?? a.action_key,
@@ -502,6 +515,8 @@ async function handleAction(
       cooldown_sec: a.cooldown_sec ?? 0,
       cooldown_remaining: remainingSec,
       is_ready: aCooldownMs === 0 || remainingSec === 0,
+      crit_chance: aProfile.crit,
+      back_chance: aProfile.back,
     };
   });
 

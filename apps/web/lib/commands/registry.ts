@@ -81,9 +81,9 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   },
   {
     name: "choose",
-    syntax: "choose <0|1|2>",
-    description: "발생한 이벤트의 선택지 선택 (0=기본, 1=고급, 2=위험)",
-    examples: ["choose 0", "choose 1", "choose 2"],
+    syntax: "choose <0|1|2|3>",
+    description: "이벤트 선택지 선택 (0=안전75%, 1=균형60%, 2=위험40%, 3=도박25%). 결과는 확률로 결정됨",
+    examples: ["choose 0", "choose 1", "choose 2", "choose 3"],
     category: "solo",
   },
   {
@@ -96,7 +96,7 @@ export const COMMAND_REGISTRY: CommandDef[] = [
   {
     name: "draw",
     syntax: "draw",
-    description: "현재 페이즈의 티켓 3장을 무작위로 뽑아 선택. A/B/C 단축키로 즉시 선택 가능",
+    description: "현재 페이즈의 티켓 4장을 무작위로 뽑아 선택. run start·work 완료 후 자동 실행됨. A/B/C/D 단축키 사용 가능",
     examples: ["draw"],
     category: "solo",
   },

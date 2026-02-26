@@ -140,6 +140,22 @@ serve(async (req: Request) => {
     score = calcSpeedrunScore({ elapsed_sec, quality: run.quality, debt: run.debt });
   }
 
+  // 운 보너스: 이벤트 선택 outcome 집계
+  const { data: runEvents } = await admin
+    .from("run_events")
+    .select("result")
+    .eq("run_id", run_id)
+    .not("choice_index", "is", null);
+
+  let luckBonus = 0;
+  for (const ev of runEvents ?? []) {
+    const ot = (ev.result as Record<string, unknown>)?.outcome_type;
+    if (ot === "success") luckBonus += 8;
+    else if (ot === "partial") luckBonus += 2;
+    else if (ot === "fail") luckBonus -= 10;
+  }
+  score = Math.max(0, score + luckBonus);
+
   // PvP 엔트리 삽입
   await admin.from("pvp_entries").insert({
     match_id,
@@ -205,7 +221,8 @@ serve(async (req: Request) => {
     breakdown: match.mode === "golf"
       ? { cmd_count: run.cmd_count, quality: run.quality, debt: run.debt, elapsed_sec }
       : { elapsed_sec, quality: run.quality, debt: run.debt },
-    message: `[PvP 제출 완료] 점수: ${score}  (+${pvpBonus}cr 보상)`,
+    luck_bonus: luckBonus,
+    message: `[PvP 제출 완료] 점수: ${score}  (+${pvpBonus}cr 보상)${luckBonus !== 0 ? `  운 보너스: ${luckBonus > 0 ? "+" : ""}${luckBonus}pt` : ""}`,
   };
 
   return json({ ok: true, result });

@@ -124,20 +124,38 @@ export async function executeCommand(
         const r = res.data?.result as Record<string, unknown> | undefined;
         const resources = r?.resources as { time: number; risk: number; debt: number; quality: number } | undefined;
         const seedStr = (r?.seed as string | undefined)?.slice(-8) ?? "????????";
-        return {
-          logs: [
-            sys(`┌${"─".repeat(46)}┐`),
-            sys(`│  Tier ${tier}  │  페이즈: 기획  │  seed: ...${seedStr}  │`),
-            sys(`└${"─".repeat(46)}┘`),
-            ...(resources ? formatResourceBars(resources) : []),
-            sys("─".repeat(48)),
-            info("  draw          → 티켓 3장 무작위 뽑기 (추천)"),
-            info("  tickets        → 현재 페이즈 전체 티켓 목록"),
-            info("  event          → 랜덤 이벤트 발생"),
-            sys("─".repeat(48)),
-          ],
-          autoRefresh: true,
-        };
+        const runId = r?.run_id as string | undefined;
+
+        const startLogs: LogLine[] = [
+          sys(`┌${"─".repeat(46)}┐`),
+          sys(`│  Tier ${tier}  │  페이즈: 기획  │  seed: ...${seedStr}  │`),
+          sys(`└${"─".repeat(46)}┘`),
+          ...(resources ? formatResourceBars(resources) : []),
+          sys("─".repeat(48)),
+          info("  event          → 랜덤 이벤트 발생"),
+          info("  tickets        → 현재 페이즈 전체 티켓 목록"),
+          sys("─".repeat(48)),
+        ];
+
+        // 자동 draw
+        if (runId) {
+          const drawRes = await callAPI("/api/run-command", {
+            action: "draw",
+            run_id: runId,
+            idempotency_key: `${context.characterId}-autodraw-start-${Date.now()}`,
+          });
+          if (drawRes.ok) {
+            const dd = drawRes.data?.result as Record<string, unknown> | undefined;
+            const drawHand = (dd?.hand ?? []) as DrawTicket[];
+            const { interactive, quickMode } = buildDrawInteractive(drawHand, dd?.phase as string | undefined);
+            return {
+              logs: [...startLogs, ...formatDrawHand(dd), interactive],
+              quickMode,
+              autoRefresh: true,
+            };
+          }
+        }
+        return { logs: startLogs, autoRefresh: true };
       }
 
       if (subcommand === "status") {
@@ -179,7 +197,7 @@ export async function executeCommand(
       });
       if (!res.ok) return { logs: [err(res.error ?? "이벤트 발생 실패")] };
       const evData = res.data?.result as Record<string, unknown> | undefined;
-      const choices = (evData?.choices ?? []) as Array<{ label: string; description?: string }>;
+      const choices = (evData?.choices ?? []) as Array<{ label: string; description?: string; risk_level?: string }>;
       const interactiveLog: LogLine = {
         timestamp: new Date().toISOString(),
         level: "interactive",
@@ -187,7 +205,7 @@ export async function executeCommand(
         data: {
           type: "choices",
           items: choices.map((c, i) => ({
-            label: c.label,
+            label: `${RISK_BADGE[c.risk_level ?? ""] ?? ""}  ${c.label}`,
             command: `choose ${i}`,
             meta: c.description,
             key: String(i),
@@ -197,7 +215,7 @@ export async function executeCommand(
       return {
         logs: [...formatEventCard(evData ?? {}), interactiveLog],
         quickMode: {
-          hint: `0/1/2로 선택 — ${String(evData?.title ?? "")}`,
+          hint: `0/1/2/3으로 선택 — ${String(evData?.title ?? "")}`,
           map: Object.fromEntries(choices.map((_, i) => [String(i), `choose ${i}`])),
         },
       };
@@ -206,8 +224,8 @@ export async function executeCommand(
     // ──────────── choose ────────────
     case "choose": {
       const choiceIndex = parseInt(subcommand ?? args[0] ?? "0");
-      if (isNaN(choiceIndex) || choiceIndex < 0 || choiceIndex > 2) {
-        return { logs: [err("선택지 번호는 0, 1, 2 중 하나여야 합니다")] };
+      if (isNaN(choiceIndex) || choiceIndex < 0 || choiceIndex > 3) {
+        return { logs: [err("선택지 번호는 0~3 중 하나여야 합니다")] };
       }
       if (!context.activeRunId) return { logs: [err("활성 런이 없습니다")] };
       const res = await callAPI("/api/run-command", {
@@ -220,13 +238,20 @@ export async function executeCommand(
       const r = res.data?.result as Record<string, unknown> | undefined;
       const dt = r?.delta as Record<string, number> | undefined;
       const resources = r?.resources as { time: number; risk: number; debt: number; quality: number } | undefined;
+      const rollData = r?.roll_data as Record<string, unknown> | undefined;
+      const outcomeType = String(r?.outcome_type ?? "");
+      const colorFn = outcomeType === "success" ? success : outcomeType === "partial" ? warn : err;
       const tSign = (dt?.time ?? 0) >= 0 ? "+" : "";
       const rSign = (dt?.risk ?? 0) >= 0 ? "+" : "";
       const dSign = (dt?.debt ?? 0) >= 0 ? "+" : "";
       const qSign = (dt?.quality ?? 0) >= 0 ? "+" : "";
+      const rollLog: LogLine | null = rollData
+        ? { timestamp: new Date().toISOString(), level: "roll", message: "이벤트 판정", data: rollData }
+        : null;
       return {
         logs: [
-          success(`[선택] ${r?.choice}`),
+          ...(rollLog ? [rollLog] : []),
+          colorFn(`[${outcomeType.toUpperCase()}] ${r?.choice} → ${r?.outcome_label}`),
           info(`변화: 시간${tSign}${dt?.time}  위험${rSign}${dt?.risk}  부채${dSign}${dt?.debt}  품질${qSign}${dt?.quality}`),
           ...(resources ? formatResourceBars(resources) : []),
         ],
@@ -277,34 +302,10 @@ export async function executeCommand(
         base_risk_delta: number;
         base_quality_delta: number;
       }>;
-      const drawLabels = ["A", "B", "C"];
-      const drawInteractive: LogLine = {
-        timestamp: new Date().toISOString(),
-        level: "interactive",
-        message: "티켓 선택",
-        data: {
-          type: "cards",
-          items: hand.map((ticket, i) => {
-            const rdStr = ticket.base_risk_delta >= 0 ? `+${ticket.base_risk_delta}` : String(ticket.base_risk_delta);
-            const qdStr = ticket.base_quality_delta >= 0 ? `+${ticket.base_quality_delta}` : String(ticket.base_quality_delta);
-            return {
-              label: ticket.title,
-              command: `work ${ticket.ticket_key}`,
-              meta: `시간:-${ticket.base_time_cost}  위험:${rdStr}  품질:${qdStr}`,
-              badge: ticket.position_tag,
-              key: drawLabels[i],
-            };
-          }),
-        },
-      };
+      const { interactive: drawInteractive, quickMode: drawQuickMode } = buildDrawInteractive(hand, drawResult?.phase as string | undefined);
       return {
         logs: [...preLogs, ...formatDrawHand(drawResult), drawInteractive],
-        quickMode: {
-          hint: `A/B/C로 티켓 선택 (페이즈: ${PHASE_KO[String(drawResult?.phase ?? "")] ?? String(drawResult?.phase ?? "")})`,
-          map: Object.fromEntries(
-            hand.map((ticket, i) => [drawLabels[i], `work ${ticket.ticket_key}`]),
-          ),
-        },
+        quickMode: drawQuickMode,
       };
     }
 
@@ -419,6 +420,29 @@ export async function executeCommand(
         logs.push(success("★ 모든 페이즈 클리어! 런 자동 완료"));
         if (r?.completion_bonus_credits) {
           logs.push(info(`완주 보너스: +${r.completion_bonus_credits}cr 지급`));
+        }
+      }
+
+      // 런이 계속 진행 중이면 자동 draw
+      const runOver = r?.auto_completed ||
+        (resources?.time ?? 1) <= 0 ||
+        (resources?.risk ?? 0) >= 100;
+
+      if (!runOver && context.activeRunId) {
+        const drawRes = await callAPI("/api/run-command", {
+          action: "draw",
+          run_id: context.activeRunId,
+          idempotency_key: `${context.characterId}-autodraw-work-${Date.now()}`,
+        });
+        if (drawRes.ok) {
+          const dd = drawRes.data?.result as Record<string, unknown> | undefined;
+          const drawHand = (dd?.hand ?? []) as DrawTicket[];
+          const { interactive, quickMode } = buildDrawInteractive(drawHand, dd?.phase as string | undefined);
+          return {
+            logs: [...logs, sys("─".repeat(48)), ...formatDrawHand(dd), interactive],
+            quickMode,
+            autoRefresh: true,
+          };
         }
       }
 
@@ -712,11 +736,17 @@ export async function executeCommand(
         const bd      = r?.breakdown as Record<string, unknown> | undefined;
         const isGolf  = mode === "golf" || String(r?.mode) === "golf";
         const pvpCredits = r?.credits_earned as number | undefined;
+        const luckBonus  = r?.luck_bonus as number | undefined;
         return {
           logs: [
             success(`★ PvP 제출 완료!`),
             info(`최종 점수: ${score}점`),
             ...(pvpCredits ? [info(`보상: +${pvpCredits}cr 지급`)] : []),
+            ...(luckBonus !== undefined && luckBonus !== 0
+              ? [luckBonus > 0
+                  ? success(`운 보너스: +${luckBonus}pt (이벤트 성공)`)
+                  : warn(`운 패널티: ${luckBonus}pt (이벤트 실패)`)]
+              : []),
             sys("── 성적표 ─────────────────────────────────────"),
             isGolf
               ? info(`  커맨드 수: ${bd?.cmd_count}  품질: ${bd?.quality}  부채: ${bd?.debt}  시간: ${bd?.elapsed_sec}초`)
@@ -1061,6 +1091,8 @@ type RaidAction = {
   cooldown_sec?: number;
   cooldown_remaining?: number;
   is_ready?: boolean;
+  crit_chance?: number;
+  back_chance?: number;
 };
 
 // ──────────── 페이즈 한글 매핑 ────────────
@@ -1101,11 +1133,18 @@ function formatRollBar(
   };
 }
 
+const RISK_BADGE: Record<string, string> = {
+  safe:     "[안전 75%]",
+  balanced: "[균형 60%]",
+  risky:    "[위험 40%]",
+  gamble:   "[도박 25%]",
+};
+
 function formatEventCard(data: Record<string, unknown>): LogLine[] {
   const title = String(data.title ?? "");
   const description = String(data.description ?? "");
   const severity = Number(data.severity ?? 1);
-  const choices = (data.choices ?? []) as Array<{ label: string; description?: string }>;
+  const choices = (data.choices ?? []) as Array<{ label: string; description?: string; risk_level?: string }>;
   const hr = "─".repeat(48);
   return [
     sys(`┌${hr}┐`),
@@ -1113,10 +1152,41 @@ function formatEventCard(data: Record<string, unknown>): LogLine[] {
     sys(`├${hr}┤`),
     info(`│  ${description}`),
     sys(`├${hr}┤`),
-    ...choices.map((c, i) => info(`│  [${i}] ${c.label}`)),
+    ...choices.map((c, i) => info(`│  [${i}] ${RISK_BADGE[c.risk_level ?? ""] ?? ""}  ${c.label}`)),
     sys(`└${hr}┘`),
-    info(`choose <0|1|2> 로 선택하세요`),
+    info(`choose <0|1|2|3> 로 선택하세요`),
   ];
+}
+
+// 티켓 확률 표시 — work 성공/실패/크리 기본 확률(70/25/5%) 기반
+function ticketProbDisplay(riskDelta: number, qualDelta: number): string {
+  // RISK: 성공 시 riskDelta, 실패 시 riskDelta+2, 크리 시 riskDelta-2
+  const pRiskUp =
+    (riskDelta     > 0 ? 0.70 : 0) +
+    (riskDelta + 2 > 0 ? 0.25 : 0) +
+    (riskDelta - 2 > 0 ? 0.05 : 0);
+
+  // QUAL: 성공 시 qualDelta, 실패 시 qualDelta-1, 크리 시 qualDelta+5
+  const pQualUp =
+    (qualDelta     > 0 ? 0.70 : 0) +
+    (qualDelta - 1 > 0 ? 0.25 : 0) +
+    (qualDelta + 5 > 0 ? 0.05 : 0);
+
+  const riskStr =
+    pRiskUp >= 0.92 ? "위험↑ 확정" :
+    pRiskUp >= 0.65 ? `위험↑ ${Math.round(pRiskUp * 100)}%` :
+    pRiskUp <= 0.08 ? "위험↓ 확정" :
+    pRiskUp <= 0.35 ? `위험↓ ${Math.round((1 - pRiskUp) * 100)}%` :
+                      `위험± ~${Math.round(pRiskUp * 100)}%↑`;
+
+  const qualStr =
+    pQualUp >= 0.92 ? "품질↑ 확정" :
+    pQualUp >= 0.65 ? `품질↑ ${Math.round(pQualUp * 100)}%` :
+    pQualUp <= 0.08 ? "품질↓ 확정" :
+    pQualUp <= 0.35 ? `품질↓ ${Math.round((1 - pQualUp) * 100)}%` :
+                      `품질± ~${Math.round(pQualUp * 100)}%↑`;
+
+  return `시간↓ 확정  ${riskStr}  ${qualStr}`;
 }
 
 function formatDrawHand(data: Record<string, unknown> | undefined): LogLine[] {
@@ -1130,7 +1200,7 @@ function formatDrawHand(data: Record<string, unknown> | undefined): LogLine[] {
     base_risk_delta: number;
     base_quality_delta: number;
   }>;
-  const labels = ["A", "B", "C"];
+  const labels = ["A", "B", "C", "D"];
   const hr = "─".repeat(52);
   const phaseKo = PHASE_KO[phase] ?? phase;
   const headerLabel = `티켓 패 (페이즈: ${phaseKo})`;
@@ -1139,15 +1209,47 @@ function formatDrawHand(data: Record<string, unknown> | undefined): LogLine[] {
     sys(`┌── ${headerLabel} ${"─".repeat(headerPad)}┐`),
   ];
   hand.forEach((ticket, i) => {
-    const rdStr = ticket.base_risk_delta >= 0 ? `+${ticket.base_risk_delta}` : String(ticket.base_risk_delta);
-    const qdStr = ticket.base_quality_delta >= 0 ? `+${ticket.base_quality_delta}` : String(ticket.base_quality_delta);
-    lines.push(info(`│  [${labels[i]}] ${ticket.ticket_key.padEnd(16)} ${ticket.title}`));
-    lines.push(info(`│      시간:-${ticket.base_time_cost}  위험:${rdStr}  품질:${qdStr}  [${ticket.position_tag}]`));
+    const prob = ticketProbDisplay(ticket.base_risk_delta, ticket.base_quality_delta);
+    lines.push(info(`│  [${labels[i]}] ${ticket.ticket_key.padEnd(16)} [${ticket.position_tag}]  ${ticket.title}`));
+    lines.push(info(`│       ${prob}`));
     if (i < hand.length - 1) lines.push(sys(`├${hr}┤`));
   });
   lines.push(sys(`└${hr}┘`));
-  lines.push(info(`work <ticket_key> 로 티켓 처리 시작`));
   return lines;
+}
+
+type DrawTicket = {
+  ticket_key: string; title: string; position_tag: string;
+  base_time_cost: number; base_risk_delta: number; base_quality_delta: number;
+};
+
+function buildDrawInteractive(
+  hand: DrawTicket[],
+  phase?: string,
+): { interactive: LogLine; quickMode: QuickMode } {
+  const labels = ["A", "B", "C", "D"];
+  const phaseLabel = PHASE_KO[phase ?? ""] ?? (phase ?? "");
+  return {
+    interactive: {
+      timestamp: new Date().toISOString(),
+      level: "interactive",
+      message: "티켓 선택",
+      data: {
+        type: "cards",
+        items: hand.map((ticket, i) => ({
+          label: ticket.title,
+          command: `work ${ticket.ticket_key}`,
+          meta: `[${ticket.position_tag}]  ${ticketProbDisplay(ticket.base_risk_delta, ticket.base_quality_delta)}`,
+          badge: ticket.position_tag,
+          key: labels[i],
+        })),
+      },
+    },
+    quickMode: {
+      hint: `A/B/C/D로 티켓 선택${phaseLabel ? ` (페이즈: ${phaseLabel})` : ""}`,
+      map: Object.fromEntries(hand.map((t, i) => [labels[i], `work ${t.ticket_key}`])),
+    },
+  };
 }
 
 function formatPhaseBanner(from: string, to: string): LogLine[] {
@@ -1488,11 +1590,14 @@ function formatRaidActionMenu(actions: RaidAction[]): LogLine[] {
   for (const a of actions) {
     const effect = formatKPIEffect(a.kpi_effect ?? {});
     const isReady = a.is_ready !== false && (a.cooldown_remaining ?? 0) === 0;
+    const chanceStr = a.crit_chance !== undefined
+      ? `치명${Math.round(a.crit_chance * 100)}%/역효${Math.round((a.back_chance ?? 0) * 100)}%`
+      : "";
     if (isReady) {
       readyIdx++;
-      lines.push(info(`  [${readyIdx}] ${a.label.padEnd(18)} ${effect}`));
+      lines.push(info(`  [${readyIdx}] ${a.label.padEnd(16)} ${chanceStr.padEnd(14)} ${effect}`));
     } else {
-      lines.push(sys(`  [ ] ${a.label.padEnd(18)} ⏱ ${a.cooldown_remaining}초`));
+      lines.push(sys(`  [ ] ${a.label.padEnd(16)} ⏱ ${a.cooldown_remaining}초`));
     }
   }
   lines.push(sys("──────────────────────────────────────────────────"));

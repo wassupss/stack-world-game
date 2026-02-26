@@ -31,7 +31,7 @@ const RunCommandSchema = z.discriminatedUnion("action", [
   z.object({
     action: z.literal("choose"),
     run_id: z.string().uuid(),
-    choice_index: z.number().int().min(0).max(2),
+    choice_index: z.number().int().min(0).max(3),
     idempotency_key: z.string().min(1).max(128),
   }),
   z.object({
@@ -392,6 +392,26 @@ async function handleEvent(
   return json({ ok: true, result });
 }
 
+// ──────────── 확률 선택지 타입 ────────────
+type OutcomeType = "success" | "partial" | "fail";
+
+interface ChoiceOutcome {
+  type: OutcomeType;
+  label: string;
+  time_delta: number;
+  risk_delta: number;
+  debt_delta: number;
+  quality_delta: number;
+  prob: number;
+}
+
+interface ProbabilisticChoice {
+  label: string;
+  description: string;
+  risk_level: string;
+  outcomes: ChoiceOutcome[];
+}
+
 // ──────────── Action: choose ────────────
 async function handleChoose(
   db: ReturnType<typeof createClient>,
@@ -424,15 +444,7 @@ async function handleChoose(
     return json({ error: "이벤트 데이터 오류" }, 500);
   }
 
-  const choices = eventData.choices as Array<{
-    label: string;
-    time_delta: number;
-    risk_delta: number;
-    debt_delta: number;
-    quality_delta: number;
-    required_command?: string;
-    bonus_event_chance?: number;
-  }>;
+  const choices = eventData.choices as ProbabilisticChoice[];
 
   if (input.choice_index >= choices.length) {
     return json({ error: `선택지는 0~${choices.length - 1}만 가능합니다` }, 400);
@@ -440,14 +452,26 @@ async function handleChoose(
 
   const choice = choices[input.choice_index];
 
-  // 고급 선택지 해금 검사 (required_command는 커맨드 카운트 임계값 등으로 확장 가능)
-  // 현재는 단순 레벨 체크 생략 (확장 지점)
+  // ── 확률 기반 outcome 롤 ──
+  const rng = seededRng(run.seed, `choose-${run.cmd_count}-${lastEvent.id.slice(0, 8)}`);
+  const roll = rng();
+
+  let outcomeType: OutcomeType = "fail";
+  let cumulative = 0;
+  for (const o of choice.outcomes) {
+    cumulative += o.prob ?? 0;
+    if (roll <= cumulative) {
+      outcomeType = o.type;
+      break;
+    }
+  }
+  const outcome = choice.outcomes.find((o) => o.type === outcomeType) ?? choice.outcomes[choice.outcomes.length - 1];
 
   // 자원 갱신
-  const newTime = Math.max(0, run.time + choice.time_delta);
-  const newRisk = Math.min(MAX_RISK, Math.max(0, run.risk + choice.risk_delta));
-  const newDebt = Math.min(MAX_DEBT, Math.max(0, run.debt + choice.debt_delta));
-  const newQuality = Math.min(100, Math.max(0, run.quality + choice.quality_delta));
+  const newTime = Math.max(0, run.time + outcome.time_delta);
+  const newRisk = Math.min(MAX_RISK, Math.max(0, run.risk + outcome.risk_delta));
+  const newDebt = Math.min(MAX_DEBT, Math.max(0, run.debt + outcome.debt_delta));
+  const newQuality = Math.min(100, Math.max(0, run.quality + outcome.quality_delta));
 
   await db.from("runs").update({
     time: newTime,
@@ -456,8 +480,21 @@ async function handleChoose(
     quality: newQuality,
   }).eq("id", run.id);
 
-  // 이벤트 처리 완료 마킹
-  await db.from("run_events").update({ choice_index: input.choice_index, result: choice })
+  // 이벤트 처리 완료 마킹 (outcome_type 포함 저장)
+  const eventResult = {
+    choice_label: choice.label,
+    risk_level: choice.risk_level,
+    outcome_type: outcomeType,
+    outcome_label: outcome.label,
+    roll: roll.toFixed(3),
+    delta: {
+      time: outcome.time_delta,
+      risk: outcome.risk_delta,
+      debt: outcome.debt_delta,
+      quality: outcome.quality_delta,
+    },
+  };
+  await db.from("run_events").update({ choice_index: input.choice_index, result: eventResult })
     .eq("id", lastEvent.id);
 
   // 런 실패 체크
@@ -466,16 +503,30 @@ async function handleChoose(
       .eq("id", run.id);
   }
 
+  // roll_data: AnimatedRollEntry 재활용
+  const successProb = choice.outcomes.find((o) => o.type === "success")?.prob ?? 0.5;
+  const roll_data = {
+    roll,
+    threshold: successProb,
+    isCritical: outcomeType === "success" && choice.risk_level === "gamble",
+    isFumble: outcomeType === "fail",
+    isSuccess: outcomeType !== "fail",
+  };
+
   const result = {
     choice: choice.label,
+    risk_level: choice.risk_level,
+    outcome_type: outcomeType,
+    outcome_label: outcome.label,
     delta: {
-      time: choice.time_delta,
-      risk: choice.risk_delta,
-      debt: choice.debt_delta,
-      quality: choice.quality_delta,
+      time: outcome.time_delta,
+      risk: outcome.risk_delta,
+      debt: outcome.debt_delta,
+      quality: outcome.quality_delta,
     },
     resources: { time: newTime, risk: newRisk, debt: newDebt, quality: newQuality },
-    message: `[선택] ${choice.label}`,
+    roll_data,
+    message: `[선택] ${choice.label} → ${outcome.label}`,
   };
 
   await logCommand(db, character.id, run.id, "choose", input, result, input.idempotency_key);
@@ -1072,7 +1123,7 @@ async function handleDraw(
     const j = Math.floor(rng() * (i + 1));
     [shuffled[i], shuffled[j]] = [shuffled[j], shuffled[i]];
   }
-  const hand = shuffled.slice(0, 3);
+  const hand = shuffled.slice(0, 4);
 
   const result = {
     phase: run.phase,
@@ -1082,7 +1133,7 @@ async function handleDraw(
     position_streak: run.position_streak ?? 0,
     position_streak_tag: run.position_streak_tag ?? null,
     resources: { time: run.time, risk: run.risk, debt: run.debt, quality: run.quality },
-    message: `[드로우] ${run.phase} 페이즈 티켓 ${hand.length}장 뽑음`,
+    message: `[드로우] ${run.phase} 페이즈 티켓 ${hand.length}장 뽑음 (peek <key>로 상세 확인 가능)`,
   };
 
   await logCommand(db, character.id, run.id, "draw", input, result, input.idempotency_key);
