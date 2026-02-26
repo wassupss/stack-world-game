@@ -6,11 +6,22 @@ import type { ParsedCommand } from "./parser";
 import type { LogLine, QuickMode } from "@stack-world/shared";
 import { COMMAND_MAP } from "./registry";
 
+export type ResourceSnapshot = { time: number; risk: number; debt: number; quality: number };
+
+export interface TurnResult {
+  type: "work" | "choose";
+  label: string;
+  outcome: "critical" | "success" | "partial" | "fail" | "fumble";
+  delta?: ResourceSnapshot;
+  resources?: ResourceSnapshot;
+}
+
 export interface ExecuteResult {
   logs: LogLine[];
   data?: Record<string, unknown>;
   quickMode?: QuickMode | null;
   autoRefresh?: boolean;
+  turnResult?: TurnResult;
 }
 
 type SupabaseClient = {
@@ -149,7 +160,7 @@ export async function executeCommand(
             const drawHand = (dd?.hand ?? []) as DrawTicket[];
             const { interactive, quickMode } = buildDrawInteractive(drawHand, dd?.phase as string | undefined);
             return {
-              logs: [...startLogs, ...formatDrawHand(dd), interactive],
+              logs: [...startLogs, interactive],
               quickMode,
               autoRefresh: true,
             };
@@ -197,19 +208,24 @@ export async function executeCommand(
       });
       if (!res.ok) return { logs: [err(res.error ?? "이벤트 발생 실패")] };
       const evData = res.data?.result as Record<string, unknown> | undefined;
-      const choices = (evData?.choices ?? []) as Array<{ label: string; description?: string; risk_level?: string }>;
+      const choices = (evData?.choices ?? []) as EventChoice[];
       const interactiveLog: LogLine = {
         timestamp: new Date().toISOString(),
         level: "interactive",
         message: "이벤트 선택지",
         data: {
           type: "choices",
-          items: choices.map((c, i) => ({
-            label: `${RISK_BADGE[c.risk_level ?? ""] ?? ""}  ${c.label}`,
-            command: `choose ${i}`,
-            meta: c.description,
-            key: String(i),
-          })),
+          items: choices.map((c, i) => {
+            const probs = getChoiceProbs(c);
+            const probStr = `성공 ${Math.round(probs.s * 100)}%  부분 ${Math.round(probs.p * 100)}%  실패 ${Math.round(probs.f * 100)}%`;
+            const rLabel = RISK_LABEL[c.risk_level ?? ""] ?? "";
+            return {
+              label: `${rLabel ? `[${rLabel}] ` : ""}${c.label}`,
+              command: `choose ${i}`,
+              meta: `${probStr}${c.description ? `  |  ${c.description}` : ""}`,
+              key: String(i),
+            };
+          }),
         },
       };
       return {
@@ -241,21 +257,52 @@ export async function executeCommand(
       const rollData = r?.roll_data as Record<string, unknown> | undefined;
       const outcomeType = String(r?.outcome_type ?? "");
       const colorFn = outcomeType === "success" ? success : outcomeType === "partial" ? warn : err;
-      const tSign = (dt?.time ?? 0) >= 0 ? "+" : "";
-      const rSign = (dt?.risk ?? 0) >= 0 ? "+" : "";
-      const dSign = (dt?.debt ?? 0) >= 0 ? "+" : "";
-      const qSign = (dt?.quality ?? 0) >= 0 ? "+" : "";
+
+      const OUTCOME_META: Record<string, { symbol: string; label: string }> = {
+        success: { symbol: "✓", label: "성  공" },
+        partial: { symbol: "△", label: "부분성공" },
+        fail:    { symbol: "✗", label: "실  패" },
+      };
+      const meta = OUTCOME_META[outcomeType] ?? { symbol: "?", label: outcomeType.toUpperCase() };
+
       const rollLog: LogLine | null = rollData
         ? { timestamp: new Date().toISOString(), level: "roll", message: "이벤트 판정", data: rollData }
         : null;
+
+      // 델타값 화살표 포맷
+      const fmtDelta = (v: number, goodDir: "pos" | "neg") => {
+        const arrow = v > 0 ? "▲" : v < 0 ? "▼" : "─";
+        const sign  = v > 0 ? "+" : "";
+        return `${arrow}${sign}${v}`;
+      };
+
+      const choiceLabel  = String(r?.choice ?? "").slice(0, 18);
+      const outcomeLabel = String(r?.outcome_label ?? "").slice(0, 36);
+      const W = 44;
+      const bannerLine1 = `${meta.symbol}  ${meta.label}   ${choiceLabel}`;
+      const pad1 = Math.max(0, W - bannerLine1.length - 2);
+
+      const chooseLogs: LogLine[] = [
+        ...(rollLog ? [rollLog] : []),
+        sys( "╔" + "═".repeat(W) + "╗"),
+        colorFn(`║  ${bannerLine1}${"".padEnd(pad1)}║`),
+        colorFn(`║  ${outcomeLabel.padEnd(W - 2)}║`),
+        sys( "╚" + "═".repeat(W) + "╝"),
+        info(`  시간 ${fmtDelta(dt?.time ?? 0,"pos")}   위험 ${fmtDelta(dt?.risk ?? 0,"neg")}   부채 ${fmtDelta(dt?.debt ?? 0,"neg")}   품질 ${fmtDelta(dt?.quality ?? 0,"pos")}`),
+        ...(resources ? formatResourceBars(resources) : []),
+      ];
+      const chooseOutcome: TurnResult["outcome"] =
+        outcomeType === "success" ? "success" :
+        outcomeType === "partial" ? "partial" : "fail";
       return {
-        logs: [
-          ...(rollLog ? [rollLog] : []),
-          colorFn(`[${outcomeType.toUpperCase()}] ${r?.choice} → ${r?.outcome_label}`),
-          info(`변화: 시간${tSign}${dt?.time}  위험${rSign}${dt?.risk}  부채${dSign}${dt?.debt}  품질${qSign}${dt?.quality}`),
-          ...(resources ? formatResourceBars(resources) : []),
-        ],
+        logs: chooseLogs,
         autoRefresh: true,
+        turnResult: {
+          type: "choose",
+          label: String(r?.choice ?? "").slice(0, 14),
+          outcome: chooseOutcome,
+          delta: dt ? { time: dt.time ?? 0, risk: dt.risk ?? 0, debt: dt.debt ?? 0, quality: dt.quality ?? 0 } : undefined,
+        },
       };
     }
 
@@ -304,7 +351,7 @@ export async function executeCommand(
       }>;
       const { interactive: drawInteractive, quickMode: drawQuickMode } = buildDrawInteractive(hand, drawResult?.phase as string | undefined);
       return {
-        logs: [...preLogs, ...formatDrawHand(drawResult), drawInteractive],
+        logs: [...preLogs, drawInteractive],
         quickMode: drawQuickMode,
       };
     }
@@ -349,6 +396,8 @@ export async function executeCommand(
       logs.push(formatRollBar(roll, threshold, isSuccess, isCritical, isFumble));
 
       // ── 결과 배너 ──
+      const ticketTitle  = String(r?.ticket_title  ?? ticketKey);
+      const narrative    = String(r?.ticket_narrative ?? "");
       if (isCritical) {
         logs.push(sys("╔════════════════════════════╗"));
         logs.push(success("║  ★★  치명타!  ★★          ║"));
@@ -359,6 +408,13 @@ export async function executeCommand(
         logs.push(sys("╚════════════════════════════╝"));
       } else {
         logs.push(isSuccess ? success(String(r?.message ?? "")) : warn(String(r?.message ?? "")));
+      }
+
+      // ── 티켓 내러티브 ──
+      if (narrative) {
+        const narrativeFn = isCritical ? success : isFumble ? err : isSuccess ? success : warn;
+        logs.push(narrativeFn(`  ▶ ${ticketTitle}`));
+        logs.push(narrativeFn(`    ${narrative}`));
       }
 
       // ── 위험 사고 ──
@@ -423,6 +479,14 @@ export async function executeCommand(
         }
       }
 
+      // 턴 결과 요약
+      const workTurnResult: TurnResult = {
+        type: "work",
+        label: ticketKey.slice(0, 14),
+        outcome: isCritical ? "critical" : isFumble ? "fumble" : isSuccess ? "success" : "fail",
+        resources: resources ?? undefined,
+      };
+
       // 런이 계속 진행 중이면 자동 draw
       const runOver = r?.auto_completed ||
         (resources?.time ?? 1) <= 0 ||
@@ -439,14 +503,15 @@ export async function executeCommand(
           const drawHand = (dd?.hand ?? []) as DrawTicket[];
           const { interactive, quickMode } = buildDrawInteractive(drawHand, dd?.phase as string | undefined);
           return {
-            logs: [...logs, sys("─".repeat(48)), ...formatDrawHand(dd), interactive],
+            logs: [...logs, sys("─".repeat(48)), interactive],
             quickMode,
             autoRefresh: true,
+            turnResult: workTurnResult,
           };
         }
       }
 
-      return { logs, autoRefresh: true };
+      return { logs, autoRefresh: true, turnResult: workTurnResult };
     }
 
     // ──────────── craft ────────────
@@ -1133,29 +1198,70 @@ function formatRollBar(
   };
 }
 
-const RISK_BADGE: Record<string, string> = {
-  safe:     "[안전 75%]",
-  balanced: "[균형 60%]",
-  risky:    "[위험 40%]",
-  gamble:   "[도박 25%]",
+interface EventChoice {
+  label: string;
+  description?: string;
+  risk_level?: string;
+  outcomes?: Array<{ type: string; prob: number }>;
+}
+
+const RISK_LABEL: Record<string, string> = {
+  safe:     "안전",
+  balanced: "균형",
+  risky:    "위험",
+  gamble:   "도박",
 };
 
+function getChoiceProbs(c: EventChoice): { s: number; p: number; f: number } {
+  if (c.outcomes && c.outcomes.length > 0) {
+    return {
+      s: c.outcomes.find(o => o.type === "success")?.prob ?? 0,
+      p: c.outcomes.find(o => o.type === "partial")?.prob ?? 0,
+      f: c.outcomes.find(o => o.type === "fail")?.prob   ?? 0,
+    };
+  }
+  const fallback: Record<string, { s: number; p: number; f: number }> = {
+    safe:     { s: 0.75, p: 0.15, f: 0.10 },
+    balanced: { s: 0.60, p: 0.25, f: 0.15 },
+    risky:    { s: 0.40, p: 0.25, f: 0.35 },
+    gamble:   { s: 0.25, p: 0.15, f: 0.60 },
+  };
+  return fallback[c.risk_level ?? "balanced"] ?? { s: 0.60, p: 0.25, f: 0.15 };
+}
+
 function formatEventCard(data: Record<string, unknown>): LogLine[] {
-  const title = String(data.title ?? "");
+  const title       = String(data.title ?? "");
   const description = String(data.description ?? "");
-  const severity = Number(data.severity ?? 1);
-  const choices = (data.choices ?? []) as Array<{ label: string; description?: string; risk_level?: string }>;
-  const hr = "─".repeat(48);
-  return [
+  const severity    = Number(data.severity ?? 1);
+  const phase       = String(data.phase ?? "");
+  const choices     = (data.choices ?? []) as EventChoice[];
+  const hr = "─".repeat(52);
+  const severityStars = "★".repeat(severity) + "☆".repeat(Math.max(0, 5 - severity));
+  const phaseLabel = phase ? ` [${(PHASE_KO[phase] ?? phase).toUpperCase()}]` : "";
+
+  const lines: LogLine[] = [
     sys(`┌${hr}┐`),
-    sys(`│  ⚡ ${title}  [${severity}★]`),
+    sys(`│  ⚡ ${title}  ${severityStars}${phaseLabel}`),
     sys(`├${hr}┤`),
     info(`│  ${description}`),
     sys(`├${hr}┤`),
-    ...choices.map((c, i) => info(`│  [${i}] ${RISK_BADGE[c.risk_level ?? ""] ?? ""}  ${c.label}`)),
-    sys(`└${hr}┘`),
-    info(`choose <0|1|2|3> 로 선택하세요`),
   ];
+
+  choices.forEach((c, i) => {
+    const probs = getChoiceProbs(c);
+    const rLabel = RISK_LABEL[c.risk_level ?? ""] ?? "";
+    const probStr = `성공 ${Math.round(probs.s * 100)}%  부분 ${Math.round(probs.p * 100)}%  실패 ${Math.round(probs.f * 100)}%`;
+    lines.push(info(`│  [${i}] ${rLabel ? `[${rLabel}] ` : ""}${c.label}`));
+    lines.push(sys( `│       ${probStr}`));
+    if (c.description) {
+      const desc = c.description.length > 44 ? c.description.slice(0, 43) + "…" : c.description;
+      lines.push(info(`│       "${desc}"`));
+    }
+  });
+
+  lines.push(sys(`└${hr}┘`));
+  lines.push(info(`choose <0|1|2|3> 로 선택하세요`));
+  return lines;
 }
 
 // 티켓 확률 표시 — work 성공/실패/크리 기본 확률(70/25/5%) 기반

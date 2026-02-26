@@ -15,6 +15,7 @@ import CommandInput from "./CommandInput";
 import type { ChatMessage } from "./RaidChatPanel";
 import { parseCommand } from "@/lib/commands/parser";
 import { executeCommand } from "@/lib/commands/executor";
+import type { TurnResult } from "@/lib/commands/executor";
 import { createBrowserClient } from "@/lib/supabase/client";
 import { useRaidRealtime } from "@/lib/hooks/useRaidRealtime";
 import type { LogLine, QuickMode } from "@stack-world/shared";
@@ -72,6 +73,7 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [flashType, setFlashType] = useState<"gold" | "red" | "green" | null>(null);
   const [flashKey, setFlashKey] = useState(0);
+  const [turnHistory, setTurnHistory] = useState<TurnResult[]>([]);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const supabase = createBrowserClient();
@@ -200,11 +202,37 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
           setActivePvpMatchId(undefined);
         }
 
+        // 턴 히스토리 누적 (최대 20턴)
+        if (result.turnResult) {
+          let entry = result.turnResult;
+          // work: statusData.active_run(old) vs turnResult.resources(new) 로 delta 계산
+          if (entry.type === "work" && entry.resources) {
+            const prevRun = statusData.active_run as Record<string, unknown> | null;
+            if (prevRun) {
+              entry = {
+                ...entry,
+                delta: {
+                  time:    entry.resources.time    - Number(prevRun.time    ?? 0),
+                  risk:    entry.resources.risk    - Number(prevRun.risk    ?? 0),
+                  debt:    entry.resources.debt    - Number(prevRun.debt    ?? 0),
+                  quality: entry.resources.quality - Number(prevRun.quality ?? 0),
+                },
+              };
+            }
+          }
+          setTurnHistory((prev) => [...prev.slice(-19), entry]);
+        }
+
         // 레이드 종료 시 NOW PLAYING 패널 즉시 해제 (race condition 방지)
         if (result.data?.raidEnded) {
           setActiveRaidId(undefined);
           setStatusData((prev) => ({ ...prev, active_raid: null, party_info: null }));
           setChatMessages([]);
+        }
+
+        // run end 시 히스토리 초기화
+        if (parsed.name === "run" && parsed.subcommand === "end") {
+          setTurnHistory([]);
         }
 
         // 자원 변경 커맨드 후 StatusPanel 자동 갱신
@@ -266,6 +294,7 @@ export default function TerminalShell({ character, positionMastery, coreMastery 
                 statusData={statusData}
                 activeRunId={activeRunId}
                 activeRaidId={activeRaidId}
+                turnHistory={turnHistory}
               />
             </div>
             {/* 레이드 채팅 (레이드 중에만) */}

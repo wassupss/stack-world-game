@@ -4,6 +4,7 @@
 // STACKWORLD - 중앙 컨텐츠 패널
 // 현재 진행 중인 솔로 런 / 레이드 / 파티 대기 상태 표시
 // ============================================================
+import type { TurnResult } from "@/lib/commands/executor";
 
 type ActiveEffect = { type: string; magnitude: number; turns_left: number };
 
@@ -16,6 +17,7 @@ interface Props {
   statusData: Record<string, unknown>;
   activeRunId?: string;
   activeRaidId?: string;
+  turnHistory?: TurnResult[];
 }
 
 // ──────────── 페이즈 정의 ────────────
@@ -36,14 +38,14 @@ const SCENARIO_NAMES: Record<string, string> = {
   GRAND_LAUNCH:   "그랜드 런칭",
 };
 
-export default function ContentPanel({ statusData, activeRunId, activeRaidId }: Props) {
+export default function ContentPanel({ statusData, activeRunId, activeRaidId, turnHistory = [] }: Props) {
   const run          = statusData.active_run  as Record<string, unknown> | null;
   const raid         = statusData.active_raid as Record<string, unknown> | null;
   const partyInfo    = statusData.party_info  as { id: string; code: string } | null;
   const partyMembers = (statusData.party_members ?? []) as PartyMember[];
 
   if (activeRunId && run) {
-    return <RunContent run={run} />;
+    return <RunContent run={run} turnHistory={turnHistory} />;
   }
 
   if (activeRaidId && raid) {
@@ -62,7 +64,7 @@ export default function ContentPanel({ statusData, activeRunId, activeRaidId }: 
 // 솔로 런 컨텐츠
 // ──────────────────────────────────────────────────────
 
-function RunContent({ run }: { run: Record<string, unknown> }) {
+function RunContent({ run, turnHistory }: { run: Record<string, unknown>; turnHistory: TurnResult[] }) {
   const phase     = String(run.phase ?? "plan");
   const tier      = Number(run.tier ?? 1);
   const cmdCount  = Number(run.cmd_count ?? 0);
@@ -156,6 +158,9 @@ function RunContent({ run }: { run: Record<string, unknown> }) {
 
       {/* 활성 효과 */}
       {effects.length > 0 && <EffectsList effects={effects} />}
+
+      {/* 턴 히스토리 */}
+      {turnHistory.length > 0 && <TurnLog history={turnHistory} />}
     </div>
   );
 }
@@ -357,6 +362,117 @@ function EffectsList({ effects }: { effects: ActiveEffect[] }) {
           <span className="text-green-700">{e.turns_left}턴</span>
         </div>
       ))}
+    </div>
+  );
+}
+
+// ──────────── 턴 히스토리 로그 ────────────
+
+const OUTCOME_STYLE: Record<TurnResult["outcome"], { symbol: string; cls: string; label: string }> = {
+  critical: { symbol: "★", cls: "text-yellow-300 font-bold", label: "대성공!" },
+  success:  { symbol: "✓", cls: "text-green-400",            label: "성공" },
+  partial:  { symbol: "△", cls: "text-yellow-500",           label: "부분 성공" },
+  fail:     { symbol: "✗", cls: "text-red-500",              label: "실패" },
+  fumble:   { symbol: "!!", cls: "text-red-600 font-bold",   label: "대실패!" },
+};
+
+// 델타에서 가장 임팩트 있는 변화를 서술형 문장으로 변환
+type DeltaSnap = { time: number; risk: number; debt: number; quality: number };
+
+function getDeltaStory(delta: DeltaSnap): string {
+  const impacts = [
+    { key: "time",    label: "일정",     value: delta.time,    upText: "여유로워짐",   downText: "줄어듦" },
+    { key: "risk",    label: "위험도",   value: delta.risk,    upText: "높아짐",       downText: "낮아짐" },
+    { key: "debt",    label: "기술부채", value: delta.debt,    upText: "쌓임",         downText: "해소됨" },
+    { key: "quality", label: "코드품질", value: delta.quality, upText: "향상됨",       downText: "저하됨" },
+  ] as const;
+
+  // good 여부: time·quality → 양수가 좋음  / risk·debt → 음수가 좋음
+  const goodDir = { time: "pos", risk: "neg", debt: "neg", quality: "pos" } as const;
+
+  const sorted = [...impacts]
+    .filter(i => i.value !== 0)
+    .sort((a, b) => Math.abs(b.value) - Math.abs(a.value));
+
+  if (sorted.length === 0) return "변화 없음";
+
+  const top = sorted[0];
+  const gd  = goodDir[top.key as keyof typeof goodDir];
+  const isGood = gd === "pos" ? top.value > 0 : top.value < 0;
+  const text = isGood ? top.upText : top.downText;
+
+  // 2번째로 큰 변화도 함께 표시 (있을 때)
+  const second = sorted[1];
+  if (second) {
+    const gd2 = goodDir[second.key as keyof typeof goodDir];
+    const isGood2 = gd2 === "pos" ? second.value > 0 : second.value < 0;
+    return `${top.label} ${text} · ${second.label} ${isGood2 ? second.upText : second.downText}`;
+  }
+  return `${top.label} ${text}`;
+}
+
+// CSS 바 (Unicode 대신 실제 div 너비 사용)
+function MiniBarRow({ label, value, good }: { label: string; value: number; good: "pos" | "neg" }) {
+  const isGood = good === "pos" ? value > 0 : value < 0;
+  const isBad  = good === "pos" ? value < 0 : value > 0;
+  const textCls = isGood ? "text-green-400" : isBad ? "text-red-400" : "text-green-900";
+  const barCls  = isGood ? "bg-green-500"   : isBad ? "bg-red-600"   : "";
+  const abs     = Math.abs(value);
+  // 절대값 1 = 5%, 최소 노출 10%, 최대 100%
+  const barPct  = abs > 0 ? Math.min(100, Math.max(10, abs * 5)) : 0;
+  const sign    = value > 0 ? "+" : "";
+
+  return (
+    <div className={`flex items-center gap-1.5 ${textCls}`}>
+      <span className="w-6 shrink-0 text-green-900 text-[9px]">{label}</span>
+      <span className="w-6 shrink-0 font-mono text-[9px] text-right">{sign}{value}</span>
+      <div className="flex-1 h-[3px] bg-green-950 rounded-full overflow-hidden">
+        {abs > 0 && (
+          <div
+            className={`h-full rounded-full ${barCls}`}
+            style={{ width: `${barPct}%` }}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+function TurnLog({ history }: { history: TurnResult[] }) {
+  const recent = [...history].reverse().slice(0, 5);
+  return (
+    <div className="border-t border-green-900 pt-2 space-y-2">
+      <div className="text-green-700 text-[10px]">── TURN LOG ──</div>
+      {recent.map((t, i) => {
+        const st     = OUTCOME_STYLE[t.outcome];
+        const turnNo = history.length - i;
+        const story  = t.delta ? getDeltaStory(t.delta) : null;
+
+        return (
+          <div key={i} className="bg-green-950/30 rounded px-1.5 py-1 space-y-1">
+            {/* 헤더: 턴번호 + 결과기호 + 라벨 */}
+            <div className="flex items-baseline gap-1 text-[10px]">
+              <span className="text-green-900 shrink-0 text-[9px]">T{turnNo}</span>
+              <span className={`shrink-0 ${st.cls}`}>{st.symbol}</span>
+              <span className={`truncate ${st.cls}`}>{t.label}</span>
+            </div>
+            {/* 서술형 문장 + 결과 뱃지 */}
+            <div className="flex items-center gap-1 pl-4 text-[9px]">
+              {story && <span className="text-green-700 truncate">{story}</span>}
+              <span className={`shrink-0 font-bold ${st.cls}`}>{st.label}</span>
+            </div>
+            {/* CSS 델타 바 */}
+            {t.delta && (
+              <div className="pl-4 space-y-0.5">
+                <MiniBarRow label="시간" value={t.delta.time}    good="pos" />
+                <MiniBarRow label="위험" value={t.delta.risk}    good="neg" />
+                <MiniBarRow label="부채" value={t.delta.debt}    good="neg" />
+                <MiniBarRow label="품질" value={t.delta.quality} good="pos" />
+              </div>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
