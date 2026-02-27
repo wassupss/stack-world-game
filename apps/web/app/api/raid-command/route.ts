@@ -238,15 +238,21 @@ async function handleAction(
 
   if (!raid) return NextResponse.json({ error: "활성 레이드를 찾을 수 없습니다" }, { status: 404 });
 
-  const isMember = await db
-    .from("party_members")
-    .select("party_id")
-    .eq("party_id", raid.party_id)
-    .eq("character_id", character.id)
-    .single();
-  if (!isMember.data) return NextResponse.json({ error: "레이드 파티 멤버가 아닙니다" }, { status: 403 });
-
   const now = Date.now();
+
+  // isMember + masteries 병렬 조회 (둘 다 raid.party_id / character.id에만 의존)
+  const [isMemberRes, masteriesRes] = await Promise.all([
+    db.from("party_members")
+      .select("party_id")
+      .eq("party_id", raid.party_id)
+      .eq("character_id", character.id)
+      .single(),
+    db.from("position_mastery")
+      .select("position, level")
+      .eq("character_id", character.id),
+  ]);
+
+  if (!isMemberRes.data) return NextResponse.json({ error: "레이드 파티 멤버가 아닙니다" }, { status: 403 });
 
   if (raid.started_at) {
     const elapsed = (now - new Date(raid.started_at).getTime()) / 1000;
@@ -299,10 +305,7 @@ async function handleAction(
     return NextResponse.json({ error: `[${actionLabel}] 쿨다운 중 (${remaining}초 후 사용 가능)` }, { status: 400 });
   }
 
-  const { data: masteries } = await db
-    .from("position_mastery")
-    .select("position, level")
-    .eq("character_id", character.id);
+  const masteries = masteriesRes.data;
 
   const masteryMap = Object.fromEntries(
     (masteries ?? []).map((m: { position: string; level: number }) => [m.position, m.level]),
@@ -479,7 +482,8 @@ async function handleAction(
     message: `${outcomeLabel} (효율 ${effDisplay})${comboSuffix}`,
   };
 
-  await db.from("raid_commands").insert({
+  // 로깅 fire-and-forget
+  void db.from("raid_commands").insert({
     raid_id: input.raid_id,
     character_id: character.id,
     action_key: input.action_key,

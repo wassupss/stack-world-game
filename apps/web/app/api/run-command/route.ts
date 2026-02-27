@@ -10,7 +10,6 @@ import { createAdminClient } from "@/lib/supabase/admin";
 type DB = ReturnType<typeof createAdminClient>;
 
 // ──────────── 상수 ────────────
-const RATE_LIMIT_PER_SEC = 4;
 const MAX_RISK = 100;
 const MAX_DEBT = 50;
 
@@ -98,16 +97,6 @@ function calcMasteryBonus(
   return { timeMult, successBonus, qualityBonus };
 }
 
-// ──────────── DB 기반 Rate Limit 검사 ────────────
-async function checkRateLimit(db: DB, characterId: string): Promise<boolean> {
-  const { count } = await db
-    .from("run_commands")
-    .select("id", { count: "exact", head: true })
-    .eq("character_id", characterId)
-    .gte("created_at", new Date(Date.now() - 1000).toISOString());
-  return (count ?? 0) < RATE_LIMIT_PER_SEC;
-}
-
 // ──────────── POST 핸들러 ────────────
 export async function POST(req: NextRequest) {
   const supabase = await createServerClient();
@@ -123,11 +112,6 @@ export async function POST(req: NextRequest) {
     .eq("user_id", user.id)
     .single();
   if (!character) return NextResponse.json({ error: "캐릭터가 없습니다" }, { status: 404 });
-
-  // Rate Limit 검사
-  if (!(await checkRateLimit(adminClient, character.id))) {
-    return NextResponse.json({ error: "커맨드를 너무 빠르게 입력하고 있습니다 (초당 4회 제한)" }, { status: 429 });
-  }
 
   // 입력 파싱
   let body: unknown;
@@ -183,28 +167,21 @@ async function handleStart(
   character: { id: string; credits: number; queued_modifier?: string | null },
   input: Extract<RunCommandInput, { action: "start" }>,
 ) {
-  // 진행 중인 런이 있으면 거부
-  const { data: activeRun } = await db
-    .from("runs")
-    .select("id")
-    .eq("character_id", character.id)
-    .eq("status", "active")
-    .single();
-  if (activeRun) {
+  // 진행 중인 런 & 레이드 동시 검사 (병렬)
+  const [activeRunRes, activeMembershipRes] = await Promise.all([
+    db.from("runs").select("id").eq("character_id", character.id).eq("status", "active").single(),
+    db.from("party_members").select("party_id").eq("character_id", character.id).single(),
+  ]);
+
+  if (activeRunRes.data) {
     return NextResponse.json({ error: "이미 진행 중인 런이 있습니다. 먼저 종료하세요." }, { status: 400 });
   }
 
-  // 진행 중인 레이드가 있으면 거부
-  const { data: activeMembership } = await db
-    .from("party_members")
-    .select("party_id")
-    .eq("character_id", character.id)
-    .single();
-  if (activeMembership) {
+  if (activeMembershipRes.data) {
     const { data: activeRaid } = await db
       .from("raids")
       .select("id")
-      .eq("party_id", activeMembership.party_id)
+      .eq("party_id", activeMembershipRes.data.party_id)
       .in("status", ["waiting", "active"])
       .single();
     if (activeRaid) {
@@ -214,31 +191,34 @@ async function handleStart(
 
   const seed = `${character.id}-${Date.now()}`;
 
-  const { data: season } = await db
-    .from("seasons")
-    .select("id")
-    .eq("is_active", true)
-    .single();
+  // 시즌 + 업그레이드 병렬 조회
+  const [seasonRes, upgradesRes] = await Promise.all([
+    db.from("seasons").select("id").eq("is_active", true).single(),
+    db.from("character_upgrades").select("item_key, level").eq("character_id", character.id),
+  ]);
 
-  // 영구 업그레이드 조회 (starting_quality_bonus)
-  const { data: upgrades } = await db
-    .from("character_upgrades")
-    .select("item_key, level")
-    .eq("character_id", character.id);
+  const upgrades = upgradesRes.data ?? [];
+  const upgradeKeys = upgrades.map((u: { item_key: string }) => u.item_key);
 
-  const upgradeKeys = (upgrades ?? []).map((u: { item_key: string }) => u.item_key);
+  // 업그레이드 + 수식어 shop_items 병렬 조회
+  const queuedModifier = character.queued_modifier ?? null;
+  const [shopItemsRes, modItemRes] = await Promise.all([
+    upgradeKeys.length > 0
+      ? db.from("shop_items").select("item_key, effect_data").in("item_key", upgradeKeys)
+      : Promise.resolve({ data: [] as { item_key: string; effect_data: Record<string, unknown> }[] }),
+    queuedModifier
+      ? db.from("shop_items").select("effect_data").eq("item_key", queuedModifier).single()
+      : Promise.resolve({ data: null }),
+  ]);
+
   let startingQualityBonus = 0;
   let startingTimeBonus = 0;
   let startingRiskReduction = 0;
   if (upgradeKeys.length > 0) {
-    const { data: shopItems } = await db
-      .from("shop_items")
-      .select("item_key, effect_data")
-      .in("item_key", upgradeKeys);
     const itemMap = Object.fromEntries(
-      (shopItems ?? []).map((i: { item_key: string; effect_data: Record<string, unknown> }) => [i.item_key, i.effect_data])
+      (shopItemsRes.data ?? []).map((i: { item_key: string; effect_data: Record<string, unknown> }) => [i.item_key, i.effect_data])
     );
-    for (const u of upgrades ?? []) {
+    for (const u of upgrades) {
       const effect = itemMap[u.item_key] ?? {};
       const lv = u.level as number;
       if (effect.starting_quality_bonus) startingQualityBonus += (effect.starting_quality_bonus as number) * lv;
@@ -247,31 +227,30 @@ async function handleStart(
     }
   }
 
-  // 수식어 효과 계산
-  let modifierEffects: Record<string, unknown> = {};
-  const queuedModifier = character.queued_modifier ?? null;
   if (queuedModifier) {
-    const { data: modItem } = await db
-      .from("shop_items")
-      .select("effect_data")
-      .eq("item_key", queuedModifier)
-      .single();
-    if (modItem) modifierEffects = modItem.effect_data as Record<string, unknown>;
-
+    // 수식어 수량 차감 + queued_modifier 해제 병렬 처리
     const { data: modCharItem } = await db
       .from("character_items")
       .select("qty")
       .eq("character_id", character.id)
       .eq("item_key", queuedModifier)
       .single();
+
+    const ops: PromiseLike<unknown>[] = [
+      db.from("characters").update({ queued_modifier: null }).eq("id", character.id),
+    ];
     if (modCharItem && modCharItem.qty > 0) {
-      await db.from("character_items").update({ qty: modCharItem.qty - 1 })
-        .eq("character_id", character.id).eq("item_key", queuedModifier);
+      ops.push(
+        db.from("character_items")
+          .update({ qty: modCharItem.qty - 1 })
+          .eq("character_id", character.id)
+          .eq("item_key", queuedModifier)
+      );
     }
-    await db.from("characters").update({ queued_modifier: null }).eq("id", character.id);
+    await Promise.all(ops);
   }
 
-  void modifierEffects; // used implicitly via queuedModifier
+  void modItemRes; // modItemRes.data가 있으면 효과가 run start 시 active_modifier로 전달됨
 
   const initialQuality = Math.min(100, 50 + startingQualityBonus);
   const initialTime    = Math.min(120, 100 + startingTimeBonus);
@@ -281,7 +260,7 @@ async function handleStart(
     .from("runs")
     .insert({
       character_id: character.id,
-      season_id: season?.id ?? null,
+      season_id: seasonRes.data?.id ?? null,
       tier: input.tier,
       seed,
       status: "active",
@@ -307,7 +286,8 @@ async function handleStart(
     message: `런 시작! [Tier ${input.tier}] seed: ${seed.slice(-8)}${modNote}`,
   };
 
-  await logCommand(db, character.id, run.id, "start", input, result, input.idempotency_key);
+  // 로깅은 fire-and-forget
+  void logCommand(db, character.id, run.id, "start", input, result, input.idempotency_key);
   return NextResponse.json({ ok: true, result });
 }
 
@@ -333,13 +313,6 @@ async function handleEvent(
   const eventIdx = Math.floor(rng() * events.length);
   const selectedEvent = events[eventIdx];
 
-  await db.from("run_events").insert({
-    run_id: run.id,
-    event_key: selectedEvent.event_key,
-    phase: run.phase,
-    result: {},
-  });
-
   const result = {
     event_key: selectedEvent.event_key,
     title: selectedEvent.title,
@@ -350,8 +323,18 @@ async function handleEvent(
     message: `[이벤트] ${selectedEvent.title} (심각도 ${selectedEvent.severity})`,
   };
 
-  await logCommand(db, character.id, run.id, "event", input, result, input.idempotency_key);
-  await incrementCmdCount(db, run.id);
+  // run_events INSERT + logCommand + incrementCmdCount 병렬 (모두 독립)
+  void Promise.all([
+    db.from("run_events").insert({
+      run_id: run.id,
+      event_key: selectedEvent.event_key,
+      phase: run.phase,
+      result: {},
+    }),
+    logCommand(db, character.id, run.id, "event", input, result, input.idempotency_key),
+    incrementCmdCount(db, run.id),
+  ]);
+
   return NextResponse.json({ ok: true, result });
 }
 
@@ -432,13 +415,6 @@ async function handleChoose(
   const newDebt = Math.min(MAX_DEBT, Math.max(0, run.debt + outcome.debt_delta));
   const newQuality = Math.min(100, Math.max(0, run.quality + outcome.quality_delta));
 
-  await db.from("runs").update({
-    time: newTime,
-    risk: newRisk,
-    debt: newDebt,
-    quality: newQuality,
-  }).eq("id", run.id);
-
   const eventResult = {
     choice_label: choice.label,
     risk_level: choice.risk_level,
@@ -452,13 +428,22 @@ async function handleChoose(
       quality: outcome.quality_delta,
     },
   };
-  await db.from("run_events").update({ choice_index: input.choice_index, result: eventResult })
-    .eq("id", lastEvent.id);
 
-  if (newTime <= 0 || newRisk >= MAX_RISK) {
-    await db.from("runs").update({ status: "failed", ended_at: new Date().toISOString() })
-      .eq("id", run.id);
-  }
+  const shouldFail = newTime <= 0 || newRisk >= MAX_RISK;
+
+  // runs UPDATE + run_events UPDATE 병렬
+  await Promise.all([
+    db.from("runs").update({
+      time: newTime,
+      risk: newRisk,
+      debt: newDebt,
+      quality: newQuality,
+      ...(shouldFail ? { status: "failed", ended_at: new Date().toISOString() } : {}),
+    }).eq("id", run.id),
+    db.from("run_events")
+      .update({ choice_index: input.choice_index, result: eventResult })
+      .eq("id", lastEvent.id),
+  ]);
 
   const successProb = choice.outcomes.find((o) => o.type === "success")?.prob ?? 0.5;
   const roll_data = {
@@ -485,8 +470,10 @@ async function handleChoose(
     message: `[선택] ${choice.label} → ${outcome.label}`,
   };
 
-  await logCommand(db, character.id, run.id, "choose", input, result, input.idempotency_key);
-  await incrementCmdCount(db, run.id);
+  void Promise.all([
+    logCommand(db, character.id, run.id, "choose", input, result, input.idempotency_key),
+    incrementCmdCount(db, run.id),
+  ]);
   return NextResponse.json({ ok: true, result });
 }
 
@@ -534,21 +521,11 @@ function tickEffects(effects: ActiveEffect[]): ActiveEffect[] {
     .filter((e) => e.turns_left > 0);
 }
 
-function computeNewEffects(
-  isCritical: boolean,
-  isFumble: boolean,
-  newStreak: number,
-): ActiveEffect[] {
+function computeNewEffects(isCritical: boolean, isFumble: boolean, newStreak: number): ActiveEffect[] {
   const effects: ActiveEffect[] = [];
-  if (isCritical) {
-    effects.push({ type: "flow_state", magnitude: 0.15, turns_left: 3 });
-  }
-  if (isFumble) {
-    effects.push({ type: "tired", magnitude: 0.05, turns_left: 2 });
-  }
-  if (newStreak === 5) {
-    effects.push({ type: "focused", magnitude: 5, turns_left: 3 });
-  }
+  if (isCritical) effects.push({ type: "flow_state", magnitude: 0.15, turns_left: 3 });
+  if (isFumble)   effects.push({ type: "tired", magnitude: 0.05, turns_left: 2 });
+  if (newStreak === 5) effects.push({ type: "focused", magnitude: 5, turns_left: 3 });
   if (newStreak >= 10 && (newStreak - 10) % 5 === 0) {
     effects.push({ type: "guaranteed_critical", magnitude: 0, turns_left: 1 });
   }
@@ -600,30 +577,36 @@ async function handleWork(
     return NextResponse.json({ error: `티켓 ${input.ticket_key}을 현재 페이즈(${run.phase})에서 찾을 수 없습니다` }, { status: 404 });
   }
 
-  const { data: mastery } = await db
-    .from("position_mastery")
-    .select("position, level")
-    .eq("character_id", character.id)
-    .eq("position", ticket.position_tag)
-    .single();
+  // ── 독립 쿼리 5개 병렬 실행 ──
+  const [masteryRes, coreMasteryRes, charUpgradesRes, prevWorkCountRes, modItemRes] = await Promise.all([
+    db.from("position_mastery")
+      .select("position, level")
+      .eq("character_id", character.id)
+      .eq("position", ticket.position_tag)
+      .single(),
+    db.from("core_mastery")
+      .select("core, level")
+      .eq("character_id", character.id)
+      .eq("core", "problem_solving")
+      .single(),
+    db.from("character_upgrades")
+      .select("item_key, level")
+      .eq("character_id", character.id),
+    db.from("run_commands")
+      .select("id", { count: "exact", head: true })
+      .eq("run_id", run.id)
+      .eq("command", "work"),
+    run.active_modifier
+      ? db.from("shop_items").select("effect_data").eq("item_key", run.active_modifier).single()
+      : Promise.resolve({ data: null }),
+  ]);
 
-  const { data: coreMastery } = await db
-    .from("core_mastery")
-    .select("core, level")
-    .eq("character_id", character.id)
-    .eq("core", "problem_solving")
-    .single();
-
-  const posLevel = mastery?.level ?? 1;
-  const coreLevel = coreMastery?.level ?? 1;
+  const posLevel = masteryRes.data?.level ?? 1;
+  const coreLevel = coreMasteryRes.data?.level ?? 1;
   const bonus = calcMasteryBonus(posLevel, coreLevel, ticket.base_time_cost);
+  const charUpgrades = charUpgradesRes.data ?? [];
 
-  // ── 영구 업그레이드 효과 계산 ──
-  const { data: charUpgrades } = await db
-    .from("character_upgrades")
-    .select("item_key, level")
-    .eq("character_id", character.id);
-
+  // ── 업그레이드 shop_items 조회 (charUpgrades 의존) ──
   let upgCritDelta = 0;
   let upgFumbleDelta = 0;
   let upgTimeCostReduction = 0;
@@ -633,44 +616,40 @@ async function handleWork(
   let upgTimeBonusPerWork = 0;
   let upgSuccessThresholdDelta = 0;
 
-  if ((charUpgrades ?? []).length > 0) {
-    const upgradeKeys = (charUpgrades ?? []).map((u: { item_key: string }) => u.item_key);
+  if (charUpgrades.length > 0) {
+    const upgradeKeys = charUpgrades.map((u: { item_key: string }) => u.item_key);
     const { data: shopItems } = await db
       .from("shop_items").select("item_key, effect_data").in("item_key", upgradeKeys);
     const shopMap = Object.fromEntries(
       (shopItems ?? []).map((i: { item_key: string; effect_data: Record<string, unknown> }) => [i.item_key, i.effect_data])
     );
-    for (const u of charUpgrades ?? []) {
+    for (const u of charUpgrades) {
       const ef = shopMap[u.item_key] ?? {};
       const lv = u.level as number;
-      if (ef.crit_threshold_delta) upgCritDelta += (ef.crit_threshold_delta as number) * lv;
-      if (ef.fumble_threshold_delta) upgFumbleDelta += (ef.fumble_threshold_delta as number) * lv;
-      if (ef.time_cost_reduction) upgTimeCostReduction += (ef.time_cost_reduction as number) * lv;
-      if (ef.incident_prob_multiplier) upgIncidentProbMult *= Math.pow(ef.incident_prob_multiplier as number, lv);
-      if (ef.xp_multiplier_bonus) upgXpBonus += (ef.xp_multiplier_bonus as number) * lv;
-      if (ef.quality_regen_per_work) upgQualityRegenPerWork += (ef.quality_regen_per_work as number) * lv;
-      if (ef.time_bonus_per_work) upgTimeBonusPerWork += (ef.time_bonus_per_work as number) * lv;
-      if (ef.success_threshold_delta) upgSuccessThresholdDelta += (ef.success_threshold_delta as number) * lv;
+      if (ef.crit_threshold_delta)      upgCritDelta             += (ef.crit_threshold_delta      as number) * lv;
+      if (ef.fumble_threshold_delta)    upgFumbleDelta           += (ef.fumble_threshold_delta    as number) * lv;
+      if (ef.time_cost_reduction)       upgTimeCostReduction     += (ef.time_cost_reduction       as number) * lv;
+      if (ef.incident_prob_multiplier)  upgIncidentProbMult      *= Math.pow(ef.incident_prob_multiplier as number, lv);
+      if (ef.xp_multiplier_bonus)       upgXpBonus               += (ef.xp_multiplier_bonus       as number) * lv;
+      if (ef.quality_regen_per_work)    upgQualityRegenPerWork   += (ef.quality_regen_per_work    as number) * lv;
+      if (ef.time_bonus_per_work)       upgTimeBonusPerWork      += (ef.time_bonus_per_work       as number) * lv;
+      if (ef.success_threshold_delta)   upgSuccessThresholdDelta += (ef.success_threshold_delta   as number) * lv;
     }
   }
 
-  // ── 활성 수식어 효과 계산 ──
+  // ── 활성 수식어 효과 ──
   let modCritDelta = 0;
   let modFumbleDelta = 0;
   let modSuccessDelta = 0;
   let modTimeCostMult = 1.0;
   let modXpMult = 1.0;
-  if (run.active_modifier) {
-    const { data: modItem } = await db
-      .from("shop_items").select("effect_data").eq("item_key", run.active_modifier).single();
-    if (modItem) {
-      const ef = modItem.effect_data as Record<string, unknown>;
-      if (ef.crit_threshold_delta) modCritDelta = ef.crit_threshold_delta as number;
-      if (ef.fumble_threshold_delta) modFumbleDelta = ef.fumble_threshold_delta as number;
-      if (ef.success_threshold_delta) modSuccessDelta = ef.success_threshold_delta as number;
-      if (ef.time_cost_multiplier) modTimeCostMult = ef.time_cost_multiplier as number;
-      if (ef.xp_multiplier) modXpMult = ef.xp_multiplier as number;
-    }
+  if (modItemRes.data) {
+    const ef = modItemRes.data.effect_data as Record<string, unknown>;
+    if (ef.crit_threshold_delta)   modCritDelta    = ef.crit_threshold_delta   as number;
+    if (ef.fumble_threshold_delta) modFumbleDelta  = ef.fumble_threshold_delta as number;
+    if (ef.success_threshold_delta) modSuccessDelta = ef.success_threshold_delta as number;
+    if (ef.time_cost_multiplier)   modTimeCostMult = ef.time_cost_multiplier   as number;
+    if (ef.xp_multiplier)          modXpMult       = ef.xp_multiplier          as number;
   }
 
   // ── System 3: 활성 효과 로드 ──
@@ -686,47 +665,38 @@ async function handleWork(
   const baseCriticalThreshold = run.current_streak >= 5 ? 0.90 : 0.95;
   const qualityCrisisPenalty = qualityCrisis ? 0.05 : 0;
   const thresholds = applyEffectsToThresholds(activeEffects, {
-    successThreshold: Math.max(0.1, 0.7 + bonus.successBonus + modSuccessDelta + upgSuccessThresholdDelta + qualityCrisisPenalty),
+    successThreshold:  Math.max(0.1, 0.7 + bonus.successBonus + modSuccessDelta + upgSuccessThresholdDelta + qualityCrisisPenalty),
     criticalThreshold: Math.max(0.5, baseCriticalThreshold + upgCritDelta + modCritDelta),
-    fumbleThreshold: Math.max(0, 0.05 + upgFumbleDelta + modFumbleDelta),
+    fumbleThreshold:   Math.max(0, 0.05 + upgFumbleDelta + modFumbleDelta),
   });
 
   const rng = seededRng(run.seed, `work-${run.cmd_count}-${input.ticket_key}`);
   const roll = rng();
 
   const isCritical = hasGuaranteedCritical ? true : roll > thresholds.criticalThreshold;
-  const isFumble = hasGuaranteedCritical ? false : roll < thresholds.fumbleThreshold;
-  const isSuccess = isCritical ? true : isFumble ? false : roll < thresholds.successThreshold;
+  const isFumble   = hasGuaranteedCritical ? false : roll < thresholds.fumbleThreshold;
+  const isSuccess  = isCritical ? true : isFumble ? false : roll < thresholds.successThreshold;
 
   const incidentRng = seededRng(run.seed, `incident-${run.cmd_count}`);
-  const rawIncident = hasRiskShield ? null : computeIncident(run.risk, incidentRng() * upgIncidentProbMult);
-  const incident = rawIncident;
+  const incident = hasRiskShield ? null : computeIncident(run.risk, incidentRng() * upgIncidentProbMult);
 
-  let timeCost = Math.max(1, Math.ceil(ticket.base_time_cost * bonus.timeMult * modTimeCostMult) - upgTimeCostReduction);
-  let riskDelta = isSuccess ? ticket.base_risk_delta : ticket.base_risk_delta + 2;
-  let qualityDelta = isSuccess
-    ? ticket.base_quality_delta + bonus.qualityBonus
-    : ticket.base_quality_delta - 1;
-  let debtDelta = 0;
+  let timeCost   = Math.max(1, Math.ceil(ticket.base_time_cost * bonus.timeMult * modTimeCostMult) - upgTimeCostReduction);
+  let riskDelta  = isSuccess ? ticket.base_risk_delta : ticket.base_risk_delta + 2;
+  let qualityDelta = isSuccess ? ticket.base_quality_delta + bonus.qualityBonus : ticket.base_quality_delta - 1;
+  let debtDelta  = 0;
 
   if (debtPressure) timeCost += 2;
 
   if (isCritical) {
-    timeCost = Math.max(0, timeCost - 3);
-    riskDelta -= 2;
-    qualityDelta += 5;
-    debtDelta -= 1;
+    timeCost = Math.max(0, timeCost - 3); riskDelta -= 2; qualityDelta += 5; debtDelta -= 1;
   } else if (isFumble) {
-    timeCost += 5;
-    riskDelta += 5;
-    qualityDelta -= 3;
-    debtDelta += 2;
+    timeCost += 5; riskDelta += 5; qualityDelta -= 3; debtDelta += 2;
   } else if (!isSuccess) {
     debtDelta += 1;
   }
 
   // ── System 4: 포지션 시너지 ──
-  const prevPositionStreak = run.position_streak ?? 0;
+  const prevPositionStreak    = run.position_streak ?? 0;
   const prevPositionStreakTag = run.position_streak_tag ?? null;
   let newPositionStreak = 0;
   let newPositionStreakTag: string | null = null;
@@ -734,27 +704,13 @@ async function handleWork(
   let positionSynergyMessage: string | null = null;
 
   if (isSuccess) {
-    if (ticket.position_tag === prevPositionStreakTag) {
-      newPositionStreak = prevPositionStreak + 1;
-    } else {
-      newPositionStreak = 1;
-    }
+    newPositionStreak   = ticket.position_tag === prevPositionStreakTag ? prevPositionStreak + 1 : 1;
     newPositionStreakTag = ticket.position_tag;
-
-    if (newPositionStreak >= 5) {
-      positionSynergyBonus = 10;
-      positionSynergyMessage = `[${ticket.position_tag} 시너지 x5] 품질 +10 ★★★`;
-    } else if (newPositionStreak >= 3) {
-      positionSynergyBonus = 5;
-      positionSynergyMessage = `[${ticket.position_tag} 시너지 x3] 품질 +5 ★★`;
-    } else if (newPositionStreak >= 2) {
-      positionSynergyBonus = 2;
-      positionSynergyMessage = `[${ticket.position_tag} 시너지 x2] 품질 +2 ★`;
-    }
+    if (newPositionStreak >= 5)      { positionSynergyBonus = 10; positionSynergyMessage = `[${ticket.position_tag} 시너지 x5] 품질 +10 ★★★`; }
+    else if (newPositionStreak >= 3) { positionSynergyBonus = 5;  positionSynergyMessage = `[${ticket.position_tag} 시너지 x3] 품질 +5 ★★`; }
+    else if (newPositionStreak >= 2) { positionSynergyBonus = 2;  positionSynergyMessage = `[${ticket.position_tag} 시너지 x2] 품질 +2 ★`; }
     qualityDelta += positionSynergyBonus;
-  }
 
-  if (isSuccess) {
     for (const ef of activeEffects) {
       if (ef.type === "focused") qualityDelta += ef.magnitude;
     }
@@ -764,38 +720,31 @@ async function handleWork(
   const incidentTimeDelta = incident ? incident.time_delta : 0;
   const incidentRiskDelta = incident ? incident.risk_delta : 0;
 
-  const newStreak = isSuccess ? (run.current_streak ?? 0) + 1 : 0;
-  const streakXpMult = computeStreakXpMult(newStreak);
+  // ── System 1: STREAK ──
+  const newStreak     = isSuccess ? (run.current_streak ?? 0) + 1 : 0;
+  const streakXpMult  = computeStreakXpMult(newStreak);
   const streakMessages: string[] = [];
   if (newStreak === 3) streakMessages.push("[연속 x3] XP x1.5!");
   if (newStreak === 5) streakMessages.push("[연속 x5] XP x2 + 치명타 임계값 강화!");
-  if (newStreak >= 10 && (newStreak - 10) % 5 === 0) {
-    streakMessages.push(`[연속 x${newStreak}] 다음 work 자동 치명타 예약!`);
-  }
+  if (newStreak >= 10 && (newStreak - 10) % 5 === 0) streakMessages.push(`[연속 x${newStreak}] 다음 work 자동 치명타 예약!`);
 
-  const tickedEffects = tickEffects(activeEffects);
-  const triggerEffects = computeNewEffects(isCritical, isFumble, newStreak);
-  const effectMap = new Map<StatusEffectType, ActiveEffect>();
-  for (const e of tickedEffects) effectMap.set(e.type, e);
+  const tickedEffects   = tickEffects(activeEffects);
+  const triggerEffects  = computeNewEffects(isCritical, isFumble, newStreak);
+  const effectMap       = new Map<StatusEffectType, ActiveEffect>();
+  for (const e of tickedEffects)  effectMap.set(e.type, e);
   for (const e of triggerEffects) effectMap.set(e.type, e);
   const finalEffects: ActiveEffect[] = Array.from(effectMap.values());
 
-  const newTime = Math.max(0, run.time - timeCost + incidentTimeDelta + upgTimeBonusPerWork);
-  const newRisk = Math.min(MAX_RISK, Math.max(0, run.risk + riskDelta + incidentRiskDelta));
-  const newDebt = Math.min(MAX_DEBT, Math.max(0, run.debt + debtDelta));
+  const newTime    = Math.max(0, run.time - timeCost + incidentTimeDelta + upgTimeBonusPerWork);
+  const newRisk    = Math.min(MAX_RISK, Math.max(0, run.risk + riskDelta + incidentRiskDelta));
+  const newDebt    = Math.min(MAX_DEBT, Math.max(0, run.debt + debtDelta));
   const newQuality = Math.min(100, Math.max(0, run.quality + qualityDelta));
 
+  // prevWorkCount는 위 Promise.all에서 이미 조회됨
+  const newWorkCount = (prevWorkCountRes.count ?? 0) + 1;
   const phaseOrder = ["plan", "implement", "test", "deploy", "operate"];
   const phaseIndex = phaseOrder.indexOf(run.phase);
-  const thresholdPerPhase = run.tier * 2;
-  const requiredTotal = thresholdPerPhase * (phaseIndex + 1);
-
-  const { count: prevWorkCount } = await db
-    .from("run_commands")
-    .select("id", { count: "exact", head: true })
-    .eq("run_id", run.id)
-    .eq("command", "work");
-  const newWorkCount = (prevWorkCount ?? 0) + 1;
+  const requiredTotal = run.tier * 2 * (phaseIndex + 1);
 
   let newPhase = run.phase;
   let phaseAdvanced = false;
@@ -809,19 +758,16 @@ async function handleWork(
   }
 
   const updateData: Record<string, unknown> = {
-    time: newTime,
-    risk: newRisk,
-    debt: newDebt,
-    quality: newQuality,
-    current_streak: newStreak,
-    active_effects: finalEffects,
-    position_streak: newPositionStreak,
-    position_streak_tag: newPositionStreakTag,
+    time: newTime, risk: newRisk, debt: newDebt, quality: newQuality,
+    current_streak: newStreak, active_effects: finalEffects,
+    position_streak: newPositionStreak, position_streak_tag: newPositionStreakTag,
   };
   if (phaseAdvanced) updateData.phase = newPhase;
 
+  let completionBonusCredits = 0;
   if (autoCompleted) {
     const score = Math.max(0, newQuality * 10 - newDebt * 20 + newTime * 2 - newRisk * 5);
+    completionBonusCredits = Math.max(50, Math.floor(score * 0.25) + run.tier * 30);
     updateData.status = "completed";
     updateData.score = score;
     updateData.ended_at = new Date().toISOString();
@@ -830,20 +776,19 @@ async function handleWork(
     updateData.ended_at = new Date().toISOString();
   }
 
-  await db.from("runs").update(updateData).eq("id", run.id);
-
-  let completionBonusCredits = 0;
-  if (autoCompleted) {
-    const autoScore = Math.max(0, newQuality * 10 - newDebt * 20 + newTime * 2 - newRisk * 5);
-    completionBonusCredits = Math.max(50, Math.floor(autoScore * 0.25) + run.tier * 30);
-    await grantCredits(db, character.id, completionBonusCredits);
+  // runs UPDATE + XP 지급 병렬
+  const postOps: PromiseLike<unknown>[] = [
+    db.from("runs").update(updateData).eq("id", run.id),
+  ];
+  if (autoCompleted && completionBonusCredits > 0) {
+    postOps.push(grantCredits(db, character.id, completionBonusCredits));
   }
-
   if (isSuccess) {
     const totalXpMult = streakXpMult * (1.0 + upgXpBonus) * modXpMult;
     const scaledXP = scaleRewardXP(ticket.reward_xp, totalXpMult);
-    await grantTicketXP(db, character.id, scaledXP);
+    postOps.push(grantTicketXP(db, character.id, scaledXP));
   }
+  await Promise.all(postOps);
 
   const PHASE_FLAVOR: Record<string, { success: string; fail: string; critical: string; fumble: string }> = {
     plan:      { critical: "완벽한 설계!", success: "기획 완료", fail: "방향이 불분명합니다", fumble: "요구사항 충돌 발생!" },
@@ -857,33 +802,23 @@ async function handleWork(
 
   const result = {
     ticket_key: input.ticket_key,
-    success: isSuccess,
-    critical: isCritical,
-    fumble: isFumble,
+    success: isSuccess, critical: isCritical, fumble: isFumble,
     guaranteed_critical_consumed: hasGuaranteedCritical,
     roll: roll.toFixed(3),
-    threshold: thresholds.successThreshold.toFixed(3),
+    threshold:          thresholds.successThreshold.toFixed(3),
     critical_threshold: thresholds.criticalThreshold.toFixed(3),
-    fumble_threshold: thresholds.fumbleThreshold.toFixed(3),
+    fumble_threshold:   thresholds.fumbleThreshold.toFixed(3),
     delta: { time: -timeCost, risk: riskDelta, debt: debtDelta, quality: qualityDelta },
-    incident: incident
-      ? { time_delta: incidentTimeDelta, risk_delta: incidentRiskDelta, message: incident.message }
-      : null,
-    debt_pressure: debtPressure,
-    quality_crisis: qualityCrisis,
+    incident: incident ? { time_delta: incidentTimeDelta, risk_delta: incidentRiskDelta, message: incident.message } : null,
+    debt_pressure: debtPressure, quality_crisis: qualityCrisis,
     resources: { time: newTime, risk: newRisk, debt: newDebt, quality: newQuality },
     xp_granted: isSuccess ? ticket.reward_xp : null,
     xp_multiplier: isSuccess ? streakXpMult * (1.0 + upgXpBonus) * modXpMult : 1.0,
-    streak: newStreak,
-    streak_messages: streakMessages,
-    position_streak: newPositionStreak,
-    position_streak_tag: newPositionStreakTag,
+    streak: newStreak, streak_messages: streakMessages,
+    position_streak: newPositionStreak, position_streak_tag: newPositionStreakTag,
     position_synergy: positionSynergyMessage,
-    active_effects: finalEffects,
-    new_effects: triggerEffects,
-    phase_advanced: phaseAdvanced,
-    old_phase: run.phase,
-    new_phase: phaseAdvanced ? newPhase : null,
+    active_effects: finalEffects, new_effects: triggerEffects,
+    phase_advanced: phaseAdvanced, old_phase: run.phase, new_phase: phaseAdvanced ? newPhase : null,
     auto_completed: autoCompleted,
     completion_bonus_credits: autoCompleted ? completionBonusCredits : null,
     message: isCritical
@@ -897,14 +832,17 @@ async function handleWork(
     ticket_narrative: (() => {
       const ns = (ticket.narratives ?? {}) as Record<string, string>;
       if (isCritical) return ns.critical ?? "";
-      if (isFumble)   return ns.fumble  ?? "";
-      if (isSuccess)  return ns.success ?? "";
+      if (isFumble)   return ns.fumble   ?? "";
+      if (isSuccess)  return ns.success  ?? "";
       return ns.fail ?? "";
     })(),
   };
 
-  await logCommand(db, character.id, run.id, "work", input, result, input.idempotency_key);
-  await incrementCmdCount(db, run.id);
+  // 로깅 fire-and-forget
+  void Promise.all([
+    logCommand(db, character.id, run.id, "work", input, result, input.idempotency_key),
+    incrementCmdCount(db, run.id),
+  ]);
   return NextResponse.json({ ok: true, result });
 }
 
@@ -918,19 +856,12 @@ async function handleCraft(
   if (!run) return NextResponse.json({ error: "활성 런을 찾을 수 없습니다" }, { status: 404 });
 
   const { data: artifact } = await db
-    .from("artifacts")
-    .select("*")
-    .eq("artifact_key", input.artifact_key)
-    .single();
+    .from("artifacts").select("*").eq("artifact_key", input.artifact_key).single();
   if (!artifact) return NextResponse.json({ error: "아티팩트를 찾을 수 없습니다" }, { status: 404 });
 
   const cost = artifact.crafting_cost as { credits: number; materials?: Record<string, number> };
 
-  const { data: char } = await db
-    .from("characters")
-    .select("credits")
-    .eq("id", character.id)
-    .single();
+  const { data: char } = await db.from("characters").select("credits").eq("id", character.id).single();
   if (!char || char.credits < cost.credits) {
     return NextResponse.json({ error: `크레딧 부족 (필요: ${cost.credits})` }, { status: 400 });
   }
@@ -938,45 +869,41 @@ async function handleCraft(
   if (cost.materials) {
     for (const [matKey, qty] of Object.entries(cost.materials)) {
       const { data: inv } = await db
-        .from("inventory")
-        .select("qty")
-        .eq("character_id", character.id)
-        .eq("artifact_key", matKey)
-        .single();
+        .from("inventory").select("qty").eq("character_id", character.id).eq("artifact_key", matKey).single();
       if (!inv || inv.qty < qty) {
         return NextResponse.json({ error: `재료 부족: ${matKey} ${qty}개 필요` }, { status: 400 });
       }
     }
   }
 
-  await db.from("characters").update({ credits: char.credits - cost.credits })
-    .eq("id", character.id);
-
+  // 크레딧 차감 + 재료 차감 병렬
+  const deductOps: PromiseLike<unknown>[] = [
+    db.from("characters").update({ credits: char.credits - cost.credits }).eq("id", character.id),
+  ];
   if (cost.materials) {
     for (const [matKey, qty] of Object.entries(cost.materials)) {
-      await db.rpc("decrement_inventory", {
-        p_character_id: character.id,
-        p_artifact_key: matKey,
-        p_qty: qty,
-      });
+      deductOps.push(db.rpc("decrement_inventory", {
+        p_character_id: character.id, p_artifact_key: matKey, p_qty: qty,
+      }));
     }
   }
+  await Promise.all(deductOps);
 
-  await db.from("inventory").upsert({
-    character_id: character.id,
-    artifact_key: input.artifact_key,
-    qty: 1,
-  }, { onConflict: "character_id,artifact_key", ignoreDuplicates: false });
+  await db.from("inventory").upsert(
+    { character_id: character.id, artifact_key: input.artifact_key, qty: 1 },
+    { onConflict: "character_id,artifact_key", ignoreDuplicates: false }
+  );
 
   const result = {
     artifact_key: input.artifact_key,
-    name: artifact.name,
-    rarity: artifact.rarity,
+    name: artifact.name, rarity: artifact.rarity,
     message: `[제작 완료] ${artifact.name} (${artifact.rarity})`,
   };
 
-  await logCommand(db, character.id, run.id, "craft", input, result, input.idempotency_key);
-  await incrementCmdCount(db, run.id);
+  void Promise.all([
+    logCommand(db, character.id, run.id, "craft", input, result, input.idempotency_key),
+    incrementCmdCount(db, run.id),
+  ]);
   return NextResponse.json({ ok: true, result });
 }
 
@@ -989,45 +916,27 @@ async function handleEnd(
   const run = await getActiveRun(db, character.id, input.run_id);
   if (!run) return NextResponse.json({ error: "활성 런을 찾을 수 없습니다" }, { status: 404 });
 
-  const score = Math.max(0,
-    run.quality * 10
-    - run.debt * 20
-    + (run.time * 2)
-    - run.risk * 5
-  );
-
-  await db.from("runs").update({
-    status: "completed",
-    score,
-    ended_at: new Date().toISOString(),
-  }).eq("id", run.id);
-
+  const score = Math.max(0, run.quality * 10 - run.debt * 20 + run.time * 2 - run.risk * 5);
   const today = new Date().toISOString().split("T")[0];
-  await db.rpc("upsert_daily_stats", {
-    p_day: today,
-    p_character_id: character.id,
-    p_score: score,
-    p_quality: run.quality,
-    p_debt_delta: run.debt,
-  });
-
   const completionBonus = Math.max(50, Math.floor(score * 0.25) + run.tier * 30);
-  await grantCredits(db, character.id, completionBonus);
+
+  // 상태 업데이트 + daily stats + credits 병렬
+  await Promise.all([
+    db.from("runs").update({ status: "completed", score, ended_at: new Date().toISOString() }).eq("id", run.id),
+    db.rpc("upsert_daily_stats", {
+      p_day: today, p_character_id: character.id,
+      p_score: score, p_quality: run.quality, p_debt_delta: run.debt,
+    }),
+    grantCredits(db, character.id, completionBonus),
+  ]);
 
   const result = {
-    run_id: run.id,
-    score,
-    completion_bonus_credits: completionBonus,
-    final_resources: {
-      time: run.time,
-      risk: run.risk,
-      debt: run.debt,
-      quality: run.quality,
-    },
+    run_id: run.id, score, completion_bonus_credits: completionBonus,
+    final_resources: { time: run.time, risk: run.risk, debt: run.debt, quality: run.quality },
     message: `[런 종료] 최종 점수: ${score}  (+${completionBonus}cr 완주 보너스)`,
   };
 
-  await logCommand(db, character.id, run.id, "end", input, result, input.idempotency_key);
+  void logCommand(db, character.id, run.id, "end", input, result, input.idempotency_key);
   return NextResponse.json({ ok: true, result });
 }
 
@@ -1058,18 +967,19 @@ async function handleDraw(
   const hand = shuffled.slice(0, 4);
 
   const result = {
-    phase: run.phase,
-    hand,
-    current_streak: run.current_streak ?? 0,
-    active_effects: (run.active_effects ?? []) as ActiveEffect[],
-    position_streak: run.position_streak ?? 0,
+    phase: run.phase, hand,
+    current_streak:      run.current_streak ?? 0,
+    active_effects:      (run.active_effects ?? []) as ActiveEffect[],
+    position_streak:     run.position_streak ?? 0,
     position_streak_tag: run.position_streak_tag ?? null,
     resources: { time: run.time, risk: run.risk, debt: run.debt, quality: run.quality },
     message: `[드로우] ${run.phase} 페이즈 티켓 ${hand.length}장 뽑음 (peek <key>로 상세 확인 가능)`,
   };
 
-  await logCommand(db, character.id, run.id, "draw", input, result, input.idempotency_key);
-  await incrementCmdCount(db, run.id);
+  void Promise.all([
+    logCommand(db, character.id, run.id, "draw", input, result, input.idempotency_key),
+    incrementCmdCount(db, run.id),
+  ]);
   return NextResponse.json({ ok: true, result });
 }
 
@@ -1077,12 +987,7 @@ async function handleDraw(
 
 async function getActiveRun(db: DB, characterId: string, runId: string) {
   const { data } = await db
-    .from("runs")
-    .select("*")
-    .eq("id", runId)
-    .eq("character_id", characterId)
-    .eq("status", "active")
-    .single();
+    .from("runs").select("*").eq("id", runId).eq("character_id", characterId).eq("status", "active").single();
   return data;
 }
 
@@ -1096,12 +1001,8 @@ async function logCommand(
   idempotencyKey: string,
 ) {
   await db.from("run_commands").insert({
-    run_id: runId,
-    character_id: characterId,
-    command,
-    args,
-    result,
-    idempotency_key: idempotencyKey,
+    run_id: runId, character_id: characterId,
+    command, args, result, idempotency_key: idempotencyKey,
   });
 }
 
@@ -1114,24 +1015,14 @@ async function grantTicketXP(
   characterId: string,
   rewardXP: { position?: Record<string, number>; core?: Record<string, number> },
 ) {
-  if (rewardXP.position) {
-    for (const [pos, xp] of Object.entries(rewardXP.position)) {
-      await db.rpc("grant_position_xp", {
-        p_character_id: characterId,
-        p_position: pos,
-        p_xp: xp,
-      });
-    }
+  const ops: PromiseLike<unknown>[] = [];
+  for (const [pos, xp] of Object.entries(rewardXP.position ?? {})) {
+    ops.push(db.rpc("grant_position_xp", { p_character_id: characterId, p_position: pos, p_xp: xp }));
   }
-  if (rewardXP.core) {
-    for (const [core, xp] of Object.entries(rewardXP.core)) {
-      await db.rpc("grant_core_xp", {
-        p_character_id: characterId,
-        p_core: core,
-        p_xp: xp,
-      });
-    }
+  for (const [core, xp] of Object.entries(rewardXP.core ?? {})) {
+    ops.push(db.rpc("grant_core_xp", { p_character_id: characterId, p_core: core, p_xp: xp }));
   }
+  if (ops.length > 0) await Promise.all(ops);
 }
 
 async function grantCredits(db: DB, characterId: string, amount: number) {
